@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+*.spec
+build/
+dist/
+
+# C#
+bin/
+obj/
+.vs/
+*.user
+*.suo
+*.pdb
+
+# Build output
+Build/
+*_Test/
+
+# Runtime / secrets
+rice_harvester.json
+*.log
+.env
+
+# PyInstaller temp
+_pyi_*
+
