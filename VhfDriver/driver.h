@@ -3,7 +3,6 @@
 #include <ntddk.h>
 #include <wdf.h>
 #include <vhf.h>
-#include <hidport.h>
 
 #include "hid_descriptors.h"
 

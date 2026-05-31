@@ -4,11 +4,9 @@
 //  VHF 콜백 — 실제 HID 장치처럼 동작하기 위한 최소 구현
 // ──────────────────────────────────────────────────────────────
 
-static VOID VhfEvtReadyForNextReadReport(PVOID VhfClientContext, VHFOPERATIONHANDLE VhfOperationHandle, PVOID VhfOperationContext)
+static VOID VhfEvtReadyForNextReadReport(PVOID VhfClientContext)
 {
     UNREFERENCED_PARAMETER(VhfClientContext);
-    UNREFERENCED_PARAMETER(VhfOperationContext);
-    VhfOperationComplete(VhfOperationHandle, STATUS_SUCCESS);
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -34,7 +32,8 @@ NTSTATUS DeviceAdd(
     if (!NT_SUCCESS(status)) return status;
 
     // 유저 모드에서 \\.\QAHidCompanion 으로 열 수 있도록 심볼릭 링크 생성
-    DECLARE_CONST_UNICODE_STRING(symLink, L"\\DosDevices\\QAHidCompanion");
+    UNICODE_STRING symLink;
+    RtlInitUnicodeString(&symLink, L"\\DosDevices\\QAHidCompanion");
     WdfDeviceCreateSymbolicLink(device, &symLink);
 
     // ── 키보드 VHF 초기화 ──────────────────────────────────────

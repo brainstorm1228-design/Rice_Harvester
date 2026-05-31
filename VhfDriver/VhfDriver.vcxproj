@@ -33,18 +33,21 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
 
   <PropertyGroup>
-    <OutDir>$(SolutionDir)Build\VhfDriver\</OutDir>
-    <IntDir>$(SolutionDir)Build\_vhf_obj\</IntDir>
+    <OutDir>$(MSBuildThisFileDirectory)..\Build\VhfDriver\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)..\Build\_vhf_obj\</IntDir>
     <TargetName>VhfDriver</TargetName>
+    <WdkKmVersion Condition="'$(WdkKmVersion)' == ''">10.0.28000.0</WdkKmVersion>
+    <WdkSharedVersion Condition="'$(WdkSharedVersion)' == ''">10.0.22621.0</WdkSharedVersion>
   </PropertyGroup>
 
   <ItemDefinitionGroup>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(KernelModeDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>POOL_NX_OPTIN=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(WindowsSdkDir)Include\$(WdkKmVersion)\km;$(WindowsSdkDir)Include\$(WdkSharedVersion)\shared;$(WindowsSdkDir)Include\wdf\kmdf\1.15;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>POOL_NX_OPTIN=1;_AMD64_;AMD64;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>Level4</WarningLevel>
     </ClCompile>
     <Link>
+      <AdditionalLibraryDirectories>$(WindowsSdkDir)Lib\$(WdkKmVersion)\km\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>vhfkm.lib;wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Inf>

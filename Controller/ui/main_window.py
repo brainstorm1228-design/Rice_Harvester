@@ -1,119 +1,1081 @@
+import base64
+import io
 import os
+import random
+import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox
-from typing import Optional
+from tkinter import filedialog
+from typing import Callable, Optional
 
 import customtkinter as ctk
+from PIL import Image, ImageDraw, ImageGrab, ImageTk
 
-from config import load_config, save_config
+from config import DEFAULT_PORT, FLOWS_DIR, delete_workflow_file, load_config, load_workflows, save_config, save_workflow_file
 from models.command import Command
-from network.agent_manager import AgentManager, AgentConnection
+from network.agent_manager import AgentConnection, AgentManager
+from network.screen_client import ScreenClient
 
 ctk.set_appearance_mode("dark")
 
-# ── 색상 팔레트 ────────────────────────────────────────────────────────
-BG      = "#0d1117"
-PANEL   = "#161b22"
-CARD    = "#1c2128"
-CARD_SEL= "#2d333b"
-BORDER  = "#30363d"
-GREEN   = "#3fb950"
-BLUE    = "#58a6ff"
-RED     = "#f85149"
-YELLOW  = "#e3b341"
-TEXT    = "#e6edf3"
-MUTED   = "#8b949e"
+ACTION_TYPES = ["대기", "키 입력", "마우스 이동", "자연 이동", "클릭", "랜덤 클릭", "스크롤", "이미지 찾기", "이미지 대기", "이미지 감지"]
+BUTTON_VALUES = ["left", "right", "middle"]
+KEY_OPTIONS = [
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+    "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+    "Enter", "Space", "Tab", "Esc", "Backspace", "Delete",
+    "Left", "Right", "Up", "Down", "F1", "F2", "F3", "F4", "F5", "F6",
+    "F7", "F8", "F9", "F10", "F11", "F12",
+]
+KEY_NAME_TO_VK = {
+    "ENTER": 0x0D,
+    "SPACE": 0x20,
+    "TAB": 0x09,
+    "ESC": 0x1B,
+    "ESCAPE": 0x1B,
+    "BACKSPACE": 0x08,
+    "DELETE": 0x2E,
+    "LEFT": 0x25,
+    "UP": 0x26,
+    "RIGHT": 0x27,
+    "DOWN": 0x28,
+}
+for _n in range(1, 13):
+    KEY_NAME_TO_VK[f"F{_n}"] = 0x6F + _n
 
-FONT_MONO = ("Consolas", 10)
-FONT_MONO_SM = ("Consolas", 9)
-FONT_UI   = ("Segoe UI", 10)
-FONT_TITLE = ("Segoe UI Semibold", 11)
+FIELD_LABELS = {
+    "ms": "대기 시간(초)",
+    "key": "키",
+    "mods": "보조키(ctrl, alt, shift)",
+    "x": "X 좌표",
+    "y": "Y 좌표",
+    "duration": "이동 시간(초)",
+    "jitter": "자연스러운 흔들림(px)",
+    "button": "마우스 버튼",
+    "x1": "시작 X",
+    "y1": "시작 Y",
+    "x2": "끝 X",
+    "y2": "끝 Y",
+    "delta": "스크롤 양",
+    "image_path": "이미지 파일",
+    "threshold": "유사도",
+    "timeout": "제한 시간(초)",
+    "match_mode": "매칭",
+    "offset_x": "클릭 보정 X",
+    "offset_y": "클릭 보정 Y",
+    "interval": "감지 주기(초)",
+    "detect_action": "감지 행동",
+}
 
-ICON_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "assets", "icon.ico")
+
+def _rgb_image(image: Image.Image) -> Image.Image:
+    if image.mode == "RGB":
+        return image
+    return image.convert("RGB")
 
 
-# ──────────────────────────────────────────────────────────────────────
-#  에이전트 카드
-# ──────────────────────────────────────────────────────────────────────
+def _debug_placeholder(detail: str = "") -> Image.Image:
+    image = Image.new("RGB", (1280, 720), "#080c11")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, 1279, 719), outline="#314255", width=4)
+    draw.text((48, 48), "Debug screen preview", fill="#f4f8fc")
+    draw.text((48, 86), "Local screen capture is not available yet.", fill="#93a5ba")
+    if detail:
+        draw.text((48, 124), detail[:150], fill="#ff6b7a")
+    return image
+
+THEMES = {
+    "dark": {
+        "bg": "#080c11",
+        "surface": "#101722",
+        "panel": "#172231",
+        "panel2": "#202d3d",
+        "hover": "#29394c",
+        "stroke": "#314255",
+        "text": "#f4f8fc",
+        "muted": "#93a5ba",
+        "faint": "#62758a",
+        "blue": "#6ea8fe",
+        "green": "#5be0a0",
+        "red": "#ff6b7a",
+        "yellow": "#f0c66e",
+    },
+    "light": {
+        "bg": "#f4f7fb",
+        "surface": "#ffffff",
+        "panel": "#eef3f8",
+        "panel2": "#e3ebf3",
+        "hover": "#d8e4ef",
+        "stroke": "#c8d5e2",
+        "text": "#15202d",
+        "muted": "#5c6d80",
+        "faint": "#8292a3",
+        "blue": "#2f73da",
+        "green": "#238c5a",
+        "red": "#d64255",
+        "yellow": "#a66d00",
+    },
+}
+
+
+def _resource_path(*parts: str) -> str:
+    base = getattr(
+        sys,
+        "_MEIPASS",
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")),
+    )
+    return os.path.join(base, *parts)
+
+
+ICON_PATH = _resource_path("assets", "icon.ico")
+
+
+class DebugAgent:
+    latency_ms = 0.0
+    auto_reconnect = False
+    is_debug = True
+    vhf_installed = True
+
+    def __init__(self, index: int = 1):
+        self.index = index
+        self.host = f"debug-local-{index}"
+        self.port = -index
+        self.label = f"Debug PC {index}"
+        self.last_status = self.status()
+
+    @property
+    def is_connected(self) -> bool:
+        return True
+
+    def connect(self, timeout: float = 0.0) -> bool:
+        return True
+
+    def disconnect(self, permanent: bool = False):
+        return None
+
+    def send(self, command: Command) -> bool:
+        return True
+
+    def status(self) -> dict:
+        x, y = 0, 0
+        return {
+            "ok": True,
+            "cursor": {"x": x, "y": y},
+            "screen": {"width": 1920, "height": 1080},
+            "virtualScreen": {"x": 0, "y": 0, "width": 1920, "height": 1080},
+        }
+
+    def find_image(self, image_data: str, **options) -> dict:
+        return {"ok": False, "msg": "Debug Agent does not run image detection."}
+
+    def __str__(self) -> str:
+        return f"{self.label} / 현재 PC"
+
 
 class AgentCard(ctk.CTkFrame):
-    def __init__(self, parent, agent: AgentConnection,
-                 on_select, on_view, **kwargs):
-        super().__init__(parent, fg_color=CARD, corner_radius=8,
-                         border_width=1, border_color=BORDER, **kwargs)
+    def __init__(self, parent, app: "MainWindow", agent):
+        self.app = app
         self.agent = agent
-        self._on_select = on_select
-        self._selected  = False
+        c = app.colors
+        super().__init__(parent, fg_color=c["panel"], corner_radius=10, border_width=1, border_color=c["stroke"])
+        self.grid_columnconfigure(1, weight=1)
 
-        self.columnconfigure(1, weight=1)
+        self._dot = ctk.CTkLabel(self, text="●", width=18, text_color=c["red"])
+        self._dot.grid(row=0, column=0, rowspan=2, padx=(12, 5), pady=10)
 
-        # 상태 닷
-        self._dot = ctk.CTkLabel(self, text="●", width=16,
-                                  font=ctk.CTkFont(size=11), text_color=GREEN)
-        self._dot.grid(row=0, column=0, rowspan=2, padx=(10, 4), pady=8)
+        self._title = ctk.CTkLabel(
+            self,
+            text=str(agent),
+            anchor="w",
+            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+            text_color=c["text"],
+        )
+        self._title.grid(row=0, column=1, sticky="ew", pady=(10, 0))
 
-        # 주소
-        self._addr = ctk.CTkLabel(self, text=str(agent), anchor="w",
-                                   font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
-                                   text_color=TEXT)
-        self._addr.grid(row=0, column=1, sticky="w", pady=(8, 1))
+        self._meta = ctk.CTkLabel(
+            self,
+            text="연결 끊김",
+            anchor="w",
+            font=ctk.CTkFont(family="Consolas", size=10),
+            text_color=c["muted"],
+        )
+        self._meta.grid(row=1, column=1, sticky="ew", pady=(0, 10))
 
-        # 레이턴시
-        self._lat = ctk.CTkLabel(self, text="connecting…", anchor="w",
-                                  font=ctk.CTkFont(family="Consolas", size=9),
-                                  text_color=MUTED)
-        self._lat.grid(row=1, column=1, sticky="w", pady=(0, 8))
+        self._disconnect = ctk.CTkButton(
+            self,
+            text="끊기",
+            width=54,
+            height=28,
+            fg_color=c["panel2"],
+            hover_color=c["hover"],
+            text_color=c["text"],
+            corner_radius=7,
+            command=lambda: app.disconnect_agent(agent),
+        )
+        self._disconnect.grid(row=0, column=2, rowspan=2, padx=(8, 12), pady=10)
 
-        # 뷰 버튼
-        self._view_btn = ctk.CTkButton(
-            self, text="🖥", width=30, height=26,
-            fg_color=BORDER, hover_color="#3d444d",
-            font=ctk.CTkFont(size=13), corner_radius=6,
-            command=lambda: on_view(self.agent))
-        self._view_btn.grid(row=0, column=2, rowspan=2, padx=(4, 10))
+        for widget in (self, self._dot, self._title, self._meta):
+            widget.bind("<Button-1>", lambda _e: app.select_agent(agent))
 
-        # 클릭 → 선택
-        for w in (self, self._dot, self._addr, self._lat):
-            w.bind("<Button-1>", lambda _e: on_select(self))
-
-    def refresh(self):
-        if self.agent.is_connected:
-            self._dot.configure(text_color=GREEN)
-            lat = self.agent.latency_ms
-            self._lat.configure(
-                text=f"{lat:.0f} ms" if lat >= 0 else "online",
-                text_color=MUTED)
+    def refresh(self, selected: bool):
+        c = self.app.colors
+        online = bool(getattr(self.agent, "is_connected", False))
+        self.configure(fg_color=c["panel2"] if selected else c["panel"], border_color=c["blue"] if selected else c["stroke"])
+        self._dot.configure(text_color=c["green"] if online else c["red"])
+        self._title.configure(text_color=c["text"])
+        if online:
+            latency = getattr(self.agent, "latency_ms", -1)
+            text = "Debug / VHF OK" if getattr(self.agent, "is_debug", False) else f"{latency:.0f} ms / VHF 확인 필요"
+            status = getattr(self.agent, "last_status", {}) or {}
+            cursor = status.get("cursor") if isinstance(status, dict) else None
+            if isinstance(cursor, dict):
+                text += f" / X {cursor.get('x', 0)} Y {cursor.get('y', 0)}"
+            self._meta.configure(text=text, text_color=c["muted"])
         else:
-            self._dot.configure(text_color=RED)
-            self._lat.configure(text="offline", text_color=RED)
-
-    def set_selected(self, v: bool):
-        self._selected = v
-        self.configure(
-            fg_color=CARD_SEL if v else CARD,
-            border_color=BLUE if v else BORDER)
+            self._meta.configure(text="연결 끊김", text_color=c["red"])
 
 
-# ──────────────────────────────────────────────────────────────────────
-#  메인 윈도우
-# ──────────────────────────────────────────────────────────────────────
+class StatusDock(ctk.CTkFrame):
+    def __init__(self, parent, app: "MainWindow"):
+        self.app = app
+        c = app.colors
+        super().__init__(parent, fg_color=c["surface"], corner_radius=12, border_width=1, border_color=c["stroke"])
+        self.dropdown: Optional[ctk.CTkFrame] = None
+        self._items: list[ctk.CTkLabel] = []
+        self._dropdown_signature: tuple = ()
+        self.grid_columnconfigure(0, weight=1)
+        self._toggle = ctk.CTkButton(
+            self,
+            text="🖥",
+            width=36,
+            height=32,
+            fg_color=c["panel2"],
+            hover_color=c["hover"],
+            text_color=c["blue"],
+            corner_radius=8,
+            command=self.toggle,
+        )
+        self._toggle.grid(row=0, column=0, padx=(8, 4), pady=6, sticky="e")
+        self._health = ctk.CTkLabel(
+            self,
+            text="●",
+            width=24,
+            text_color=c["red"],
+            font=ctk.CTkFont(size=16, weight="bold"),
+        )
+        self._health.grid(row=0, column=1, padx=(0, 8), pady=6)
+
+    def toggle(self):
+        if self.dropdown is not None and self.dropdown.winfo_exists():
+            self.dropdown.destroy()
+            self.dropdown = None
+            self._dropdown_signature = ()
+            self._toggle.configure(text="🖥")
+            return
+        c = self.app.colors
+        self.dropdown = ctk.CTkFrame(self.app.root, fg_color=c["surface"], corner_radius=12, border_width=1, border_color=c["stroke"])
+        self.dropdown.place(relx=1.0, y=62, x=-18, anchor="ne")
+        self._toggle.configure(text="🖥")
+        self.refresh(self.app.all_agents())
+
+    def refresh(self, agents: list):
+        c = self.app.colors
+        self.configure(fg_color=c["surface"], border_color=c["stroke"])
+        health_color = self._connection_color(agents)
+        health_text = "정상" if health_color == c["green"] else "불안정" if health_color == c["yellow"] else "끊김"
+        self._toggle.configure(
+            text="🖥",
+            fg_color=c["panel2"],
+            hover_color=c["hover"],
+            text_color=c["blue"],
+        )
+        self._health.configure(text_color=health_color)
+        self._health.configure(text="●")
+        self._health.bind("<Button-1>", lambda _e: self.toggle())
+        if self.dropdown is None or not self.dropdown.winfo_exists():
+            return
+        signature = (
+            self.app.theme_name,
+            health_text,
+            tuple((_agent_key(agent), bool(getattr(agent, "is_connected", False)), str(agent)) for agent in agents[:16]),
+        )
+        if signature == self._dropdown_signature:
+            return
+        self._dropdown_signature = signature
+        for item in self._items:
+            item.destroy()
+        self._items.clear()
+        self.dropdown.configure(fg_color=c["surface"], border_color=c["stroke"])
+        summary = ctk.CTkLabel(
+            self.dropdown,
+            text=f"연결 상태: {health_text}",
+            text_color=health_color,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            padx=10,
+            pady=6,
+        )
+        summary.grid(row=0, column=0, columnspan=4, padx=6, pady=(8, 2), sticky="ew")
+        self._items.append(summary)
+        visible = agents[:16]
+        cols = 4
+        for idx, agent in enumerate(visible):
+            online = bool(getattr(agent, "is_connected", False))
+            row = 1 + idx // cols
+            label = ctk.CTkLabel(
+                self.dropdown,
+                text=f"{'●' if online else '○'} {agent}",
+                fg_color=c["panel"],
+                corner_radius=8,
+                text_color=c["green"] if online else c["red"],
+                font=ctk.CTkFont(family="Consolas", size=10),
+                padx=8,
+                pady=5,
+            )
+            label.grid(row=row, column=idx % cols, padx=6, pady=6, sticky="ew")
+            self._items.append(label)
+
+    def _connection_color(self, agents: list) -> str:
+        c = self.app.colors
+        if not agents:
+            return c["red"]
+        if any(not bool(getattr(agent, "is_connected", False)) for agent in agents):
+            return c["red"]
+        for agent in agents:
+            latency = float(getattr(agent, "latency_ms", -1) or -1)
+            if not getattr(agent, "is_debug", False) and (latency < 0 or latency >= 800):
+                return c["yellow"]
+        return c["green"]
+
+
+class ScreenTile(ctk.CTkFrame):
+    def __init__(self, parent, app: "MainWindow", agent):
+        self.app = app
+        self.agent = agent
+        self._remote_w = 16
+        self._remote_h = 9
+        self._frame: Optional[bytes] = None
+        self._photo: Optional[ImageTk.PhotoImage] = None
+        self._status_text = "대기"
+        self._editing = False
+        self._selected = False
+        self._render_pending = False
+        self._last_render_time = 0.0
+        self._min_render_interval = 0.1
+        self._drag_start: Optional[tuple[int, int]] = None
+        self._dragging = False
+        self._lock = threading.Lock()
+        c = app.colors
+        super().__init__(parent, fg_color=c["panel"], corner_radius=12, border_width=1, border_color=c["stroke"])
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        self.canvas = tk.Canvas(self, bg="#05080c", height=240, highlightthickness=0, cursor="hand2")
+        self.canvas.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        self._image_id = self.canvas.create_image(0, 0, anchor="nw")
+        for widget in (self, self.canvas):
+            widget.bind("<Button-1>", self._on_press)
+            widget.bind("<B1-Motion>", self._on_drag)
+            widget.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Double-Button-1>", self._on_double_click)
+        self.canvas.bind("<Configure>", lambda _e: self._schedule_render(force=True))
+
+        self.name_badge = ctk.CTkLabel(
+            self,
+            text=self.display_name(),
+            fg_color="#07140d",
+            corner_radius=8,
+            padx=9,
+            pady=4,
+            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+            text_color=c["green"],
+        )
+        self.name_badge.bind("<Button-1>", self._on_press)
+        self.name_badge.bind("<B1-Motion>", self._on_drag)
+        self.name_badge.bind("<ButtonRelease-1>", self._on_release)
+
+        self.edit_panel = ctk.CTkFrame(self, fg_color=c["surface"], corner_radius=10, border_width=1, border_color=c["stroke"])
+        self.edit_panel.grid_columnconfigure(0, weight=1)
+        self.name_entry = _entry(self.edit_panel, app, "", width=180)
+        self.name_entry.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        self.name_entry.bind("<Return>", lambda _e: self.commit_name())
+        self.name_entry.bind("<FocusOut>", lambda _e: self.commit_name())
+        self.set_edit_mode(False)
+        if getattr(agent, "is_debug", False):
+            self.set_status("Debug 화면 준비 중")
+            self.after(50, lambda: self.on_image(_debug_placeholder("Waiting for local screen capture.")))
+
+    def display_name(self) -> str:
+        return self.app.get_monitor_name(self.agent)
+
+    def _select_from_event(self, event):
+        self.app.select_monitor_agent(self.agent, multi=bool(event.state & 0x0001))
+
+    def _on_press(self, event):
+        self._select_from_event(event)
+        if self._editing:
+            self._drag_start = (event.x_root, event.y_root)
+            self._dragging = False
+            self.canvas.configure(cursor="fleur")
+        return "break"
+
+    def _on_drag(self, event):
+        if not self._editing or self._drag_start is None:
+            return
+        dx = abs(event.x_root - self._drag_start[0])
+        dy = abs(event.y_root - self._drag_start[1])
+        if dx + dy >= 8:
+            self._dragging = True
+            self.configure(border_color=self.app.colors["yellow"])
+        return "break"
+
+    def _on_release(self, event):
+        if self._editing and self._dragging:
+            self.app.reorder_monitor_tile_to_point(self.agent, event.x_root, event.y_root)
+        self._drag_start = None
+        self._dragging = False
+        self.canvas.configure(cursor="fleur" if self._editing else "hand2")
+        self.set_selected(self._selected)
+        return "break"
+
+    def _on_double_click(self, event):
+        if not self._editing:
+            self.app.open_monitor(self.agent)
+        return "break"
+
+    def refresh_name(self):
+        name = self.display_name()
+        self.name_badge.configure(text=name)
+        if self.name_entry.get() != name:
+            self.name_entry.delete(0, "end")
+            self.name_entry.insert(0, name)
+
+    def commit_name(self):
+        name = self.name_entry.get().strip() or str(self.agent)
+        self.app.set_monitor_name(self.agent, name)
+        self.refresh_name()
+
+    def set_edit_mode(self, editing: bool):
+        self._editing = editing
+        self.refresh_name()
+        if editing:
+            self.canvas.configure(cursor="fleur")
+            self.name_badge.place(x=14, y=14, anchor="nw")
+            self.edit_panel.place(relx=0.5, rely=1.0, y=-14, anchor="s", relwidth=0.94)
+        else:
+            self.canvas.configure(cursor="hand2")
+            self.name_badge.place_forget()
+            self.edit_panel.place_forget()
+
+    def set_selected(self, selected: bool):
+        self._selected = selected
+        c = self.app.colors
+        self.configure(border_width=4 if selected else 1, border_color=c["blue"] if selected else c["stroke"], fg_color=c["panel"])
+        if self._editing:
+            self.name_badge.configure(text_color=c["green"])
+
+    def apply_theme(self):
+        c = self.app.colors
+        self.canvas.configure(bg="#05080c")
+        self.edit_panel.configure(fg_color=c["surface"], border_color=c["stroke"])
+        self.name_badge.configure(fg_color="#07140d", text_color=c["green"])
+        self.set_selected(self._selected)
+
+    def set_status(self, text: str):
+        self._status_text = text
+
+    def set_monitor_load(self, tile_count: int):
+        self._min_render_interval = 0.22 if tile_count >= 9 else 0.16 if tile_count >= 5 else 0.1
+
+    def on_frame(self, jpeg: bytes, w: int, h: int):
+        with self._lock:
+            self._frame = jpeg
+            self._remote_w = max(1, w)
+            self._remote_h = max(1, h)
+        self._schedule_render()
+
+    def on_image(self, image: Image.Image):
+        image = _rgb_image(image)
+        with self._lock:
+            self._remote_w, self._remote_h = image.size
+            buf = io.BytesIO()
+            image.save(buf, format="JPEG", quality=70)
+            self._frame = buf.getvalue()
+        self._schedule_render()
+
+    def _schedule_render(self, force: bool = False):
+        if self._render_pending:
+            return
+        delay_ms = 0
+        if not force:
+            elapsed = time.monotonic() - self._last_render_time
+            delay_ms = max(0, int((self._min_render_interval - elapsed) * 1000))
+        self._render_pending = True
+        self.after(delay_ms, self._render_frame)
+
+    def _render_frame(self):
+        self._render_pending = False
+        with self._lock:
+            frame = self._frame
+        if not frame:
+            return
+        try:
+            cw = max(1, self.canvas.winfo_width())
+            ch = max(1, self.canvas.winfo_height())
+            scale = min(cw / self._remote_w, ch / self._remote_h)
+            width = max(1, int(self._remote_w * scale))
+            height = max(1, int(self._remote_h * scale))
+            x = (cw - width) // 2
+            y = (ch - height) // 2
+            image = Image.open(io.BytesIO(frame))
+            image.draft("RGB", (width, height))
+            image = image.resize((width, height), Image.BILINEAR)
+            self._photo = ImageTk.PhotoImage(image)
+            self.canvas.itemconfigure(self._image_id, image=self._photo)
+            self.canvas.coords(self._image_id, x, y)
+            self._last_render_time = time.monotonic()
+        except Exception as exc:
+            self.set_status(f"표시 오류: {exc.__class__.__name__}")
+
+
+class LocalScreenPump:
+    def __init__(self, tile: ScreenTile):
+        self.tile = tile
+        self.running = False
+
+    def start(self) -> bool:
+        self.running = True
+        self.tile.set_status("Debug 캡처 준비 중")
+        self._tick()
+        return True
+
+    def stop(self):
+        self.running = False
+
+    def _tick(self):
+        if not self.running:
+            return
+        try:
+            try:
+                image = ImageGrab.grab(all_screens=True)
+            except TypeError:
+                image = ImageGrab.grab()
+            image.thumbnail((960, 540), Image.BILINEAR)
+            self.tile.on_image(image)
+            self.tile.set_status("현재 PC 화면")
+        except Exception as exc:
+            self.tile.on_image(_debug_placeholder(str(exc)))
+            self.tile.set_status(f"캡처 실패: {exc.__class__.__name__}")
+        wait = 1400 if self.tile._min_render_interval >= 0.22 else 900 if self.tile._min_render_interval >= 0.16 else 500
+        self.tile.after(wait, self._tick)
+
+
+class ScreenWall(ctk.CTkFrame):
+    def __init__(self, parent, app: "MainWindow"):
+        self.app = app
+        c = app.colors
+        super().__init__(parent, fg_color="transparent")
+        self._tiles: dict[str, ScreenTile] = {}
+        self._agents: dict[str, object] = {}
+        self._clients: dict[str, object] = {}
+        self._preset_names: list[str] = []
+        self._preset_delete_mode = False
+        self._preset_picker: Optional[ctk.CTkFrame] = None
+        self._edit_mode = False
+        self._preset_height = 26
+        self.columns = 1
+        self._layout_signature: tuple[str, ...] = ()
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+        self.grid_rowconfigure(2, weight=0)
+
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=20, pady=(5, 4))
+        head.grid_columnconfigure(1, weight=1)
+        self.select_all_var = tk.BooleanVar(master=app.root, value=False)
+        ctk.CTkCheckBox(
+            head,
+            text="전체선택",
+            variable=self.select_all_var,
+            command=self.toggle_select_all,
+            width=92,
+            checkbox_width=16,
+            checkbox_height=16,
+            fg_color=c["blue"],
+            hover_color=c["hover"],
+            text_color=c["muted"],
+        ).grid(row=0, column=0, sticky="w")
+        self.count = ctk.CTkLabel(head, text="0대", anchor="e", text_color=c["muted"])
+        self.count.grid(row=0, column=1, sticky="e", padx=(0, 8))
+        self.edit_button = _button(head, app, "편집", self.toggle_edit_mode, width=58, color=c["panel2"])
+        self.edit_button.grid(row=0, column=2, sticky="e")
+
+        self.tile_grid = ctk.CTkFrame(self, fg_color="transparent")
+        self.tile_grid.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 4))
+        self.tile_grid.grid_columnconfigure(0, weight=1)
+        self.tile_grid.bind("<Button-1>", lambda _e: self.clear_selection())
+        self.empty = ctk.CTkFrame(self.tile_grid, fg_color=c["panel"], corner_radius=12, border_width=1, border_color=c["stroke"])
+        self.empty.grid_columnconfigure(0, weight=1)
+        self.empty.bind("<Button-1>", lambda _e: self.clear_selection())
+        ctk.CTkLabel(self.empty, text="연결된 PC가 없습니다", font=ctk.CTkFont(size=16, weight="bold"), text_color=c["text"]).grid(row=0, column=0, pady=(28, 6))
+        self.empty_hint = ctk.CTkLabel(self.empty, text="연결된 Agent가 화면에 표시됩니다.", text_color=c["muted"])
+        self.empty_hint.grid(row=1, column=0, pady=(0, 14))
+        self.empty_debug_button = _button(self.empty, app, "Debug PC 추가", app.add_debug_from_monitor, width=130, color=c["blue"])
+        self.workflow_bar = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
+        self.workflow_bar.configure(height=self._preset_height)
+        self.workflow_bar.grid(row=2, column=0, sticky="ew")
+        self.workflow_bar.grid_propagate(False)
+        self.preset_strip = ctk.CTkFrame(self.workflow_bar, fg_color=c["surface"], corner_radius=8, height=24)
+        self.preset_strip.pack(side="left", fill="x", expand=True, padx=(14, 14), pady=(0, 2))
+        self.preset_strip.pack_propagate(False)
+        self.preset_items = ctk.CTkFrame(self.preset_strip, fg_color="transparent")
+        self.preset_items.pack(side="left", fill="x", expand=True)
+        self.preset_trash_slot = ctk.CTkFrame(self.preset_strip, fg_color="transparent", width=42)
+        self.preset_trash_slot.pack(side="right", fill="y")
+        self.preset_trash_slot.pack_propagate(False)
+        self.refresh_workflows()
+
+    def sync(self, agents: list):
+        online = [a for a in agents if getattr(a, "is_connected", False)]
+        keys = {_agent_key(a) for a in online}
+        changed = False
+        self.app.monitor_order = [key for key in self.app.monitor_order if key in keys]
+        for agent in online:
+            key = _agent_key(agent)
+            if key not in self.app.monitor_order:
+                self.app.monitor_order.append(key)
+                changed = True
+        online.sort(key=lambda a: self.app.monitor_order.index(_agent_key(a)) if _agent_key(a) in self.app.monitor_order else 9999)
+        ordered_keys = tuple(_agent_key(agent) for agent in online)
+        self._agents = {_agent_key(agent): agent for agent in online}
+        for key in list(self._clients):
+            if key not in keys:
+                self._clients[key].stop()
+                del self._clients[key]
+                changed = True
+        for key in list(self._tiles):
+            if key not in keys:
+                self._tiles[key].destroy()
+                del self._tiles[key]
+                changed = True
+        self.app.monitor_selected_keys.intersection_update(keys)
+        if self.app.debug_agents:
+            self.empty_hint.configure(text="Debug PC를 추가하면 현재 PC 화면으로 모니터링 그리드를 확인할 수 있습니다.")
+            self.empty_debug_button.grid(row=2, column=0, pady=(0, 28))
+        else:
+            self.empty_hint.configure(text="연결된 Agent가 화면에 표시됩니다.")
+            self.empty_debug_button.grid_forget()
+        for agent in online:
+            key = _agent_key(agent)
+            if key not in self._tiles:
+                self._tiles[key] = ScreenTile(self.tile_grid, self.app, agent)
+                self._tiles[key].set_edit_mode(self._edit_mode)
+                changed = True
+            self._tiles[key].set_monitor_load(len(online))
+            if key not in self._clients:
+                tile = self._tiles[key]
+                if getattr(agent, "is_debug", False):
+                    client = LocalScreenPump(tile)
+                    tile.set_status("Debug / 현재 PC")
+                else:
+                    client = ScreenClient(agent.host, int(agent.port) + 1, self.app.secret, tile.on_frame)
+                if client.start():
+                    self._clients[key] = client
+        self.count.configure(text=f"{len(online)}대")
+        if changed or ordered_keys != self._layout_signature:
+            self._layout()
+            self._layout_signature = ordered_keys
+        self.select_keys(self.app.monitor_selected_keys)
+
+    def toggle_edit_mode(self):
+        self.set_edit_mode(not self._edit_mode)
+
+    def set_edit_mode(self, enabled: bool):
+        self._edit_mode = enabled
+        self.edit_button.configure(text="완료" if enabled else "편집")
+        for tile in self._tiles.values():
+            tile.set_edit_mode(enabled)
+        self.app.set_status("모니터링 편집 모드" if enabled else "모니터링 편집 종료")
+
+    def select(self, agent):
+        key = _agent_key(agent)
+        if key:
+            self.app.monitor_selected_keys = {key}
+        self.select_keys(self.app.monitor_selected_keys)
+
+    def select_keys(self, keys: set[str]):
+        for tile_key, tile in self._tiles.items():
+            tile.set_selected(tile_key in keys)
+        self.select_all_var.set(bool(self._tiles) and len(keys) == len(self._tiles))
+
+    def toggle_select_all(self):
+        if self.select_all_var.get():
+            self.select_all()
+        else:
+            self.clear_selection()
+
+    def select_all(self):
+        self.app.monitor_selected_keys = set(self._tiles.keys())
+        self.select_keys(self.app.monitor_selected_keys)
+        self.app.set_status(f"{len(self.app.monitor_selected_keys)}대 선택됨")
+
+    def clear_selection(self):
+        self.app.monitor_selected_keys.clear()
+        self.app.selected_agent = None
+        self.select_keys(self.app.monitor_selected_keys)
+        self.app.set_status("선택 해제됨")
+
+    def selected_agents(self) -> list:
+        return [self._agents[key] for key in self.app.monitor_order if key in self.app.monitor_selected_keys and key in self._agents]
+
+    def reorder_tile_to_point(self, agent, x_root: int, y_root: int):
+        source_key = _agent_key(agent)
+        if source_key not in self.app.monitor_order:
+            return
+        target_key = ""
+        for key, tile in self._tiles.items():
+            if key == source_key:
+                continue
+            left = tile.winfo_rootx()
+            top = tile.winfo_rooty()
+            right = left + tile.winfo_width()
+            bottom = top + tile.winfo_height()
+            if left <= x_root <= right and top <= y_root <= bottom:
+                target_key = key
+                break
+        if not target_key:
+            return
+        order = [key for key in self.app.monitor_order if key in self._tiles]
+        old_idx = order.index(source_key)
+        new_idx = order.index(target_key)
+        if old_idx == new_idx:
+            return
+        order.pop(old_idx)
+        if old_idx < new_idx:
+            new_idx -= 1
+        order.insert(new_idx, source_key)
+        self.app.monitor_order = order + [key for key in self.app.monitor_order if key not in order]
+        self.app.cfg["monitor_order"] = self.app.monitor_order
+        save_config(self.app.cfg)
+        self._layout_signature = ()
+        self._layout()
+        self.select_keys(self.app.monitor_selected_keys)
+        self.app.set_status("모니터링 위치 변경됨")
+
+    def apply_theme(self):
+        c = self.app.colors
+        self.configure(fg_color=c["bg"])
+        self.count.configure(text_color=c["muted"])
+        self.edit_button.configure(fg_color=c["panel2"], hover_color=c["hover"], text_color=c["text"])
+        self.empty.configure(fg_color=c["panel"], border_color=c["stroke"])
+        self.empty_hint.configure(text_color=c["muted"])
+        self.workflow_bar.configure(fg_color="transparent")
+        self.preset_strip.configure(fg_color=c["surface"])
+        for tile in self._tiles.values():
+            tile.apply_theme()
+        self.refresh_workflows()
+        self.select_keys(self.app.monitor_selected_keys)
+
+    def refresh_workflows(self):
+        for child in self.preset_items.winfo_children():
+            child.destroy()
+        for child in self.preset_trash_slot.winfo_children():
+            child.destroy()
+        c = self.app.colors
+        if not self._preset_names:
+            ctk.CTkLabel(self.preset_items, text="프리셋 없음", text_color=c["muted"], font=ctk.CTkFont(size=10), height=18).pack(side="left", padx=(8, 5), pady=3)
+        for name in list(self._preset_names):
+            row = ctk.CTkFrame(self.preset_items, fg_color="transparent")
+            row.pack(side="left", padx=2, pady=2)
+            _button(row, self.app, name, lambda n=name: self.app.run_monitor_workflow(n), width=88, height=20, color=c["panel"]).pack(side="left")
+            if self._preset_delete_mode:
+                _button(row, self.app, "X", lambda n=name: self.remove_preset(n), width=22, height=20, color=c["red"]).pack(side="left", padx=(2, 0))
+        self.add_preset_button = _button(self.preset_items, self.app, "+", self.show_preset_picker, width=28, height=20, color=c["panel2"])
+        self.add_preset_button.pack(side="left", padx=(4, 3), pady=2)
+        _button(self.preset_trash_slot, self.app, "🗑", self.toggle_preset_delete_mode, width=36, height=24, color=c["panel2"]).pack(side="right", padx=(0, 0), pady=0)
+
+    def show_preset_picker(self):
+        if self._preset_picker is not None and self._preset_picker.winfo_exists():
+            self._preset_picker.destroy()
+            self._preset_picker = None
+            return
+        self.app.reload_workflows_from_disk(update_ui=False)
+        c = self.app.colors
+        self._preset_picker = ctk.CTkToplevel(self.app.root)
+        self._preset_picker.withdraw()
+        self._preset_picker.overrideredirect(True)
+        self._preset_picker.transient(self.app.root)
+        self._preset_picker.configure(fg_color=c["surface"])
+        self._preset_picker.bind("<Escape>", lambda _e: self._close_preset_picker())
+        panel = ctk.CTkFrame(self._preset_picker, fg_color=c["surface"], corner_radius=10, border_width=1, border_color=c["stroke"])
+        panel.pack(fill="both", expand=True)
+        workflows = [w.get("name") for w in self.app.cfg.get("workflows", []) if w.get("name")]
+        available = [name for name in workflows if name not in self._preset_names]
+        if not workflows:
+            ctk.CTkLabel(panel, text="저장된 워크플로우 없음", text_color=c["muted"]).pack(padx=14, pady=12)
+            self._place_preset_picker()
+            return
+        if not available:
+            ctk.CTkLabel(panel, text="모든 워크플로우가 추가됨", text_color=c["muted"]).pack(padx=14, pady=12)
+            self._place_preset_picker()
+            return
+        for name in available:
+            _button(panel, self.app, name, lambda n=name: self.add_preset(n), width=180, height=28, color=c["panel"]).pack(fill="x", padx=8, pady=(8, 0))
+        ctk.CTkFrame(panel, height=8, fg_color="transparent").pack()
+        self._place_preset_picker()
+
+    def _place_preset_picker(self):
+        owner = getattr(self, "add_preset_button", None)
+        if self._preset_picker is None or not self._preset_picker.winfo_exists():
+            return
+        self.app.root.update_idletasks()
+        self._preset_picker.update_idletasks()
+        width = max(200, self._preset_picker.winfo_reqwidth())
+        height = max(46, self._preset_picker.winfo_reqheight())
+        root_x = self.app.root.winfo_rootx()
+        root_y = self.app.root.winfo_rooty()
+        root_w = self.app.root.winfo_width()
+        if owner is None or not owner.winfo_exists():
+            x = root_x + 14
+            y = root_y + self.app.root.winfo_height() - height - self._preset_height - 8
+        else:
+            x = owner.winfo_rootx() + owner.winfo_width() + 6
+            y = owner.winfo_rooty() - height - 6
+        x = min(max(root_x + 8, x), root_x + root_w - width - 8)
+        y = max(root_y + 64, y)
+        self._preset_picker.geometry(f"{width}x{height}+{x}+{y}")
+        self._preset_picker.deiconify()
+        self._preset_picker.lift()
+
+    def _close_preset_picker(self):
+        if self._preset_picker is not None and self._preset_picker.winfo_exists():
+            self._preset_picker.destroy()
+        self._preset_picker = None
+
+    def add_preset(self, name: str):
+        if name not in self._preset_names:
+            self._preset_names.append(name)
+        self._close_preset_picker()
+        self.refresh_workflows()
+
+    def remove_preset(self, name: str):
+        self._preset_names = [n for n in self._preset_names if n != name]
+        self.refresh_workflows()
+
+    def toggle_preset_delete_mode(self):
+        self._preset_delete_mode = not self._preset_delete_mode
+        self.refresh_workflows()
+
+    def stop_all(self):
+        for client in self._clients.values():
+            client.stop()
+        self._clients.clear()
+
+    def _layout(self):
+        if not self._tiles:
+            self.empty.grid(row=0, column=0, padx=8, pady=8, sticky="ew")
+            return
+        self.empty.grid_forget()
+        count = max(1, len(self._tiles))
+        cols = 1 if count == 1 else 2 if count <= 4 else 3 if count <= 9 else 4
+        self.columns = cols
+        for col in range(4):
+            self.tile_grid.grid_columnconfigure(col, weight=1 if col < cols else 0, uniform="monitor" if col < cols else "")
+        for row in range(8):
+            self.tile_grid.grid_rowconfigure(row, weight=0)
+        ordered_tiles = [self._tiles[key] for key in self.app.monitor_order if key in self._tiles]
+        for idx, tile in enumerate(ordered_tiles):
+            self.tile_grid.grid_rowconfigure(idx // cols, weight=1)
+            tile.grid(row=idx // cols, column=idx % cols, padx=6, pady=6, sticky="nsew")
+
+
+class WorkflowStepRow(ctk.CTkFrame):
+    def __init__(self, parent, app: "MainWindow", index: int, step: Optional[dict] = None):
+        self.app = app
+        c = app.colors
+        super().__init__(parent, fg_color=c["panel"], corner_radius=10, border_width=1, border_color=c["stroke"])
+        self.index = index
+        self.entries: dict[str, ctk.CTkEntry] = {}
+        self.menus: dict[str, ctk.CTkOptionMenu] = {}
+        self.action_var = tk.StringVar(value=(step or {}).get("type", "대기"))
+        self.grid_columnconfigure(2, weight=1)
+        self.num = ctk.CTkLabel(self, text=f"{index + 1:02d}", width=42, font=ctk.CTkFont(family="Consolas", size=13, weight="bold"), text_color=c["blue"])
+        self.num.grid(row=0, column=0, padx=(10, 4), pady=10)
+        ctk.CTkOptionMenu(
+            self,
+            values=ACTION_TYPES,
+            variable=self.action_var,
+            width=140,
+            fg_color=c["panel2"],
+            button_color=c["blue"],
+            button_hover_color=c["hover"],
+            dropdown_fg_color=c["panel"],
+            command=lambda _v: self.rebuild(),
+        ).grid(row=0, column=1, padx=6, pady=10)
+        self.fields = ctk.CTkFrame(self, fg_color="transparent")
+        self.fields.grid(row=0, column=2, sticky="ew", padx=6, pady=8)
+        tools = ctk.CTkFrame(self, fg_color="transparent")
+        tools.grid(row=0, column=3, padx=(6, 10), pady=8)
+        _mini_button(tools, app, "↑", lambda: app.move_step(self, -1)).pack(side="left", padx=2)
+        _mini_button(tools, app, "↓", lambda: app.move_step(self, 1)).pack(side="left", padx=2)
+        _mini_button(tools, app, "삭제", lambda: app.delete_step(self), width=52, color=c["red"]).pack(side="left", padx=2)
+        self.rebuild()
+        if step:
+            self.set_step(step)
+
+    def renumber(self, index: int):
+        self.index = index
+        self.num.configure(text=f"{index + 1:02d}")
+
+    def get_step(self) -> dict:
+        data: dict[str, object] = {"type": self.action_var.get()}
+        for key, entry in self.entries.items():
+            value = entry.get().strip()
+            if key in {"key", "mods", "image_path"}:
+                data[key] = value
+            elif key in {"ms", "duration", "timeout", "interval"}:
+                data[key] = _seconds_to_ms(value)
+            elif key in {"jitter", "threshold", "offset_x", "offset_y"}:
+                data[key] = _float(value, 0.0)
+            else:
+                data[key] = _int(value, 0)
+        for key, menu in self.menus.items():
+            data[key] = menu.get()
+        return data
+
+    def set_step(self, step: dict):
+        self.action_var.set(step.get("type", "대기"))
+        self.rebuild()
+        for key, value in step.items():
+            if key in self.entries:
+                self.entries[key].delete(0, "end")
+                if key in {"ms", "duration", "timeout", "interval"}:
+                    self.entries[key].insert(0, _format_seconds(_ms_to_seconds(value)))
+                elif key == "jitter":
+                    self.entries[key].insert(0, f"{_float(value, 0.0):.1f}")
+                else:
+                    self.entries[key].insert(0, str(value))
+            if key in self.menus:
+                self.menus[key].set(_display_key(value) if key == "key" else str(value))
+
+    def rebuild(self):
+        for child in self.fields.winfo_children():
+            child.destroy()
+        self.entries.clear()
+        self.menus.clear()
+        kind = self.action_var.get()
+        if kind == "대기":
+            self.add_entry("ms", "0.5")
+        elif kind == "키 입력":
+            self.add_entry("key", "A")
+            self.add_entry("mods", "ctrl+shift")
+        elif kind == "마우스 이동":
+            self.add_entry("x", "960")
+            self.add_entry("y", "540")
+        elif kind == "자연 이동":
+            self.add_entry("x", "960")
+            self.add_entry("y", "540")
+            self.add_entry("duration", "0.65")
+            self.add_entry("jitter", "3.0")
+        elif kind == "클릭":
+            self.add_menu("button", BUTTON_VALUES)
+        elif kind == "랜덤 클릭":
+            self.add_entry("x1", "850")
+            self.add_entry("y1", "450")
+            self.add_entry("x2", "1070")
+            self.add_entry("y2", "630")
+            self.add_menu("button", BUTTON_VALUES)
+        elif kind == "스크롤":
+            self.add_entry("delta", "-120")
+        elif kind == "이미지 찾기":
+            self.add_entry("image_path", "")
+            self.add_entry("threshold", "0.92")
+            self.add_entry("timeout", "3.0")
+            self.add_menu("match_mode", ["similar", "exact"])
+            self.add_entry("offset_x", "0.0")
+            self.add_entry("offset_y", "0.0")
+        elif kind == "이미지 대기":
+            self.add_entry("image_path", "")
+            self.add_entry("threshold", "0.92")
+            self.add_entry("timeout", "10.0")
+            self.add_menu("match_mode", ["similar", "exact"])
+        elif kind == "이미지 감지":
+            self.add_entry("image_path", "")
+            self.add_entry("threshold", "0.92")
+            self.add_entry("interval", "0.5")
+            self.add_entry("timeout", "1.2")
+            self.add_menu("match_mode", ["similar", "exact"])
+            self.add_menu("detect_action", ["click", "stop_agent", "stop_all", "notify"])
+            self.add_entry("offset_x", "0.0")
+            self.add_entry("offset_y", "0.0")
+
+    def add_entry(self, key: str, value: str):
+        idx = len(self.entries) + len(self.menus)
+        frame = ctk.CTkFrame(self.fields, fg_color="transparent")
+        frame.grid(row=0, column=idx, padx=4)
+        ctk.CTkLabel(frame, text=FIELD_LABELS.get(key, key), text_color=self.app.colors["faint"], font=ctk.CTkFont(size=10)).pack(anchor="w")
+        width = 280 if key == "image_path" else 136 if key == "mods" else 100
+        entry = _entry(frame, self.app, "", width=width)
+        entry.insert(0, value)
+        entry.pack()
+        if key == "image_path":
+            _mini_button(frame, self.app, "찾기", lambda e=entry: self.pick_image(e), width=54).pack(pady=(5, 0), anchor="w")
+        self.entries[key] = entry
+
+    def pick_image(self, entry: ctk.CTkEntry):
+        path = filedialog.askopenfilename(
+            title="탐색 이미지 선택",
+            filetypes=[("Image files", "*.png;*.jpg;*.jpeg;*.bmp"), ("All files", "*.*")],
+        )
+        if path:
+            entry.delete(0, "end")
+            entry.insert(0, path)
+
+    def add_menu(self, key: str, values: list[str]):
+        idx = len(self.entries) + len(self.menus)
+        frame = ctk.CTkFrame(self.fields, fg_color="transparent")
+        frame.grid(row=0, column=idx, padx=4)
+        ctk.CTkLabel(frame, text=FIELD_LABELS.get(key, key), text_color=self.app.colors["faint"], font=ctk.CTkFont(size=10)).pack(anchor="w")
+        menu = ctk.CTkOptionMenu(frame, values=values, width=120 if key == "key" else 100, fg_color=self.app.colors["bg"], button_color=self.app.colors["blue"])
+        menu.set(values[0])
+        menu.pack()
+        self.menus[key] = menu
+
 
 class MainWindow:
     def __init__(self, manager: AgentManager, secret: str = "change-this-secret"):
-        self.manager  = manager
-        self._secret  = secret
-        self._cfg     = load_config()
-        self._cards:  list[AgentCard] = []
-        self._sel:    Optional[AgentCard] = None
-        self._macro_stop = False
+        self.manager = manager
+        self.secret = secret
+        self.cfg = load_config()
+        self.theme_name = self.cfg.get("theme", "dark")
+        self.colors = THEMES.get(self.theme_name, THEMES["dark"])
+        self.cards: list[AgentCard] = []
+        self._agent_card_keys: list[str] = []
+        self.palette_frames: dict[str, object] = {}
+        self._last_agent_signature: tuple = ()
+        self.workflow_rows: list[WorkflowStepRow] = []
+        self.debug_logs: list[str] = []
+        self.debug_agents: list[DebugAgent] = []
+        self.selected_agent = None
+        self.wall: Optional[ScreenWall] = None
+        self.settings_dropdown: Optional[ctk.CTkFrame] = None
+        self.monitor_order: list[str] = list(self.cfg.get("monitor_order", []))
+        self.monitor_selected_keys: set[str] = set()
+        self.monitor_names: dict[str, str] = dict(self.cfg.get("monitor_names", {}))
+        self.current_palette = "연결"
+        self._active_palette: Optional[str] = None
+        self.macro_stop = False
+        self.last_positions: dict[str, tuple[int, int]] = {}
 
         self.root = ctk.CTk()
-        self.root.title("Rice_Harvester")
-        self.root.geometry("960x620")
-        self.root.minsize(860, 560)
-        self.root.configure(fg_color=BG)
+        self.mirror_mode = tk.BooleanVar(master=self.root, value=False)
+        self.root.title("Rice Harvester Controller")
+        self.root.geometry("1380x820")
+        self.root.minsize(1180, 720)
+        self.root.configure(fg_color=self.colors["bg"])
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.bind("<Alt-F12>", lambda _e: self.toggle_mirror())
 
         if os.path.exists(ICON_PATH):
             try:
@@ -121,612 +1083,965 @@ class MainWindow:
             except Exception:
                 pass
 
-        manager.on_status_change = lambda _: self.root.after(0, self._refresh_cards)
+        self.manager.on_status_change = lambda _agent: self.root.after(0, self.refresh_all)
+        self.build()
+        self.restore_agents()
+        self.root.after(1000, self.tick)
 
-        self._build()
-        self._restore_agents()
-        self.root.after(1500, self._tick)
+    def all_agents(self) -> list:
+        agents = list(self.manager.all_agents())
+        agents.extend(self.debug_agents)
+        return agents
 
-    # ────────────────────────────────────────────────────────────────
-    #  레이아웃 구성
-    # ────────────────────────────────────────────────────────────────
+    def add_debug_agent(self) -> DebugAgent:
+        used = {agent.index for agent in self.debug_agents}
+        index = 1
+        while index in used:
+            index += 1
+        agent = DebugAgent(index)
+        self.debug_agents.append(agent)
+        self.debug_logs.append(f"Debug agent added: {agent.label}")
+        self.debug_badge.configure(text=f"DEBUG MODE ({len(self.debug_agents)})")
+        return agent
 
-    def _build(self):
-        self.root.columnconfigure(1, weight=1)
-        self.root.rowconfigure(0, weight=1)
+    def add_debug_from_monitor(self):
+        if not self.debug_agents:
+            self.set_status("Debug 모드에서만 Debug PC를 추가할 수 있습니다.")
+            return
+        agent = self.add_debug_agent()
+        self.select_agent(agent)
+        self.set_status(f"{agent.label} 추가됨")
+        if self.wall is not None and self.wall.winfo_exists():
+            self.wall.sync(self.all_agents())
+            self.wall.select(agent)
+        else:
+            self.refresh_all()
 
-        self._build_sidebar()
-        self._build_main()
-        self._build_statusbar()
+    def build(self):
+        self.root.grid_columnconfigure(1, weight=1)
+        self.root.grid_rowconfigure(1, weight=1)
+        self.build_left_panel()
+        self.build_topbar()
+        self.palette = ctk.CTkFrame(self.root, fg_color=self.colors["bg"], corner_radius=0)
+        self.palette.grid(row=1, column=1, sticky="nsew")
+        self.palette.grid_columnconfigure(0, weight=1)
+        self.palette.grid_rowconfigure(0, weight=1)
+        self.status = ctk.CTkLabel(self.root, text="준비됨", anchor="w", fg_color=self.colors["surface"], text_color=self.colors["muted"], height=30)
+        self.status.grid(row=2, column=0, columnspan=2, sticky="ew")
+        self.show_palette("연결")
 
-    # ── 사이드바 ──────────────────────────────────────────────────
+    def build_left_panel(self):
+        c = self.colors
+        self.left = ctk.CTkFrame(self.root, width=250, fg_color=c["surface"], corner_radius=0)
+        self.left.grid(row=0, column=0, rowspan=2, sticky="nsew")
+        self.left.grid_propagate(False)
+        self.left.grid_columnconfigure(0, weight=1)
+        brand = ctk.CTkFrame(self.left, fg_color="transparent")
+        brand.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 22))
+        r = ctk.CTkLabel(brand, text="R", font=ctk.CTkFont(size=24, weight="bold"), text_color=c["blue"], cursor="hand2")
+        r.pack(side="left")
+        r.bind("<Button-1>", lambda _e: self.toggle_debug())
+        ctk.CTkLabel(brand, text="ice Harvester", font=ctk.CTkFont(size=21, weight="bold"), text_color=c["text"]).pack(side="left")
+        self.nav_buttons = {}
+        for idx, name in enumerate(("연결", "모니터링", "워크플로우")):
+            btn = ctk.CTkButton(
+                self.left,
+                text=name,
+                height=44,
+                fg_color=c["panel2"] if name == self.current_palette else "transparent",
+                hover_color=c["hover"],
+                text_color=c["text"],
+                anchor="w",
+                corner_radius=10,
+                command=lambda n=name: self.show_palette(n),
+            )
+            btn.grid(row=1 + idx, column=0, sticky="ew", padx=14, pady=5)
+            self.nav_buttons[name] = btn
 
-    def _build_sidebar(self):
-        sb = ctk.CTkFrame(self.root, width=220, fg_color=PANEL,
-                           corner_radius=0)
-        sb.grid(row=0, column=0, sticky="ns", padx=0, pady=0)
-        sb.grid_propagate(False)
-        sb.rowconfigure(3, weight=1)
+        self.debug_badge = ctk.CTkLabel(self.left, text="", text_color=c["yellow"], anchor="w")
+        self.debug_badge.grid(row=5, column=0, sticky="ew", padx=18, pady=(20, 0))
 
-        # 로고 영역
-        logo = ctk.CTkFrame(sb, fg_color="transparent")
-        logo.grid(row=0, column=0, sticky="ew", padx=12, pady=(16, 8))
-        ctk.CTkLabel(logo, text="🌾", font=ctk.CTkFont(size=22)).pack(side="left")
-        ctk.CTkLabel(logo, text="Rice_Harvester",
-                      font=ctk.CTkFont(family="Segoe UI Semibold", size=13),
-                      text_color=TEXT).pack(side="left", padx=6)
+    def build_topbar(self):
+        c = self.colors
+        self.topbar = ctk.CTkFrame(self.root, fg_color=c["bg"], corner_radius=0)
+        self.topbar.grid(row=0, column=1, sticky="ew", padx=18, pady=(14, 6))
+        self.topbar.grid_columnconfigure(0, weight=1)
+        self.title = ctk.CTkLabel(self.topbar, text="연결", anchor="w", font=ctk.CTkFont(size=24, weight="bold"), text_color=c["text"])
+        self.title.grid(row=0, column=0, sticky="ew")
+        controls = ctk.CTkFrame(self.topbar, fg_color="transparent")
+        controls.grid(row=0, column=1, sticky="e")
+        _button(controls, self, "⚙", self.open_settings, width=38, height=34, color=c["panel2"], text_color=c["blue"]).pack(side="left", padx=3)
+        _button(controls, self, self.theme_icon(), self.toggle_theme, width=38, height=34, color=c["panel2"], text_color=c["yellow"]).pack(side="left", padx=3)
+        self.theme_button = controls.winfo_children()[-1]
+        self.status_dock = StatusDock(controls, self)
+        self.status_dock.pack(side="left", padx=(6, 0))
 
-        ctk.CTkFrame(sb, height=1, fg_color=BORDER).grid(
-            row=1, column=0, sticky="ew", padx=12, pady=4)
+    def theme_icon(self) -> str:
+        return "☀" if self.theme_name == "dark" else "◐"
 
-        # 섹션 레이블
-        ctk.CTkLabel(sb, text="AGENTS", font=ctk.CTkFont(size=9, weight="bold"),
-                      text_color=MUTED).grid(row=2, column=0, sticky="w", padx=14, pady=(8, 4))
+    def show_palette(self, name: str):
+        self.current_palette = name
+        for frame in self.palette_frames.values():
+            if frame.winfo_exists():
+                frame.grid_forget()
+        self.title.configure(text=name)
+        for key, btn in self.nav_buttons.items():
+            btn.configure(fg_color=self.colors["panel2"] if key == name else "transparent")
+        frame = self.palette_frames.get(name)
+        if frame is None or not frame.winfo_exists():
+            if name == "연결":
+                frame = self.build_connect_palette()
+            elif name == "모니터링":
+                frame = self.build_monitor_palette()
+            else:
+                frame = self.build_workflow_palette()
+            self.palette_frames[name] = frame
+        frame.grid(row=0, column=0, sticky="nsew")
+        self._active_palette = name
+        if name == "연결":
+            self.rebuild_agent_cards()
+        elif name == "모니터링":
+            if self.wall is not None and self.wall.winfo_exists():
+                self.wall.sync(self.all_agents())
+                if self.monitor_selected_keys:
+                    self.wall.select_keys(self.monitor_selected_keys)
+                else:
+                    self.wall.select(self.selected_agent)
 
-        # 에이전트 스크롤 목록
-        self._agent_scroll = ctk.CTkScrollableFrame(
-            sb, fg_color="transparent", scrollbar_button_color=BORDER,
-            scrollbar_button_hover_color="#3d444d")
-        self._agent_scroll.grid(row=3, column=0, sticky="nsew", padx=8, pady=0)
-        self._agent_scroll.columnconfigure(0, weight=1)
+    def build_connect_palette(self):
+        c = self.colors
+        frame = ctk.CTkFrame(self.palette, fg_color="transparent")
+        frame.configure(border_width=0)
+        frame.grid_columnconfigure(0, weight=1)
+        connect = _section(frame, self)
+        connect.grid(row=0, column=0, sticky="ew", padx=22, pady=(18, 0))
+        connect.grid_columnconfigure(0, weight=1)
+        self.host_entry = _entry(connect, self, "IP 또는 호스트")
+        self.host_entry.grid(row=0, column=0, sticky="ew", padx=(14, 8), pady=14)
+        self.port_entry = _entry(connect, self, str(DEFAULT_PORT), width=90)
+        self.port_entry.grid(row=0, column=1, padx=(0, 8), pady=14)
+        _button(connect, self, "연결", self.connect_from_form, width=96, color=c["green"], text_color="#07140d").grid(row=0, column=2, padx=(0, 14), pady=14)
 
-        # 하단 버튼
-        btns = ctk.CTkFrame(sb, fg_color="transparent")
-        btns.grid(row=4, column=0, sticky="ew", padx=8, pady=8)
+        self.agent_list = ctk.CTkScrollableFrame(frame, fg_color="transparent", scrollbar_button_color=c["stroke"], scrollbar_button_hover_color=c["hover"])
+        self.agent_list.grid(row=1, column=0, sticky="nsew", padx=22, pady=(16, 18))
+        self.agent_list.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(1, weight=1)
+        self.rebuild_agent_cards()
+        return frame
 
-        ctk.CTkButton(btns, text="＋  Connect", height=32,
-                       fg_color=GREEN, hover_color="#2ea043", text_color="#0d1117",
-                       font=ctk.CTkFont(weight="bold"),
-                       command=self._show_connect_dialog).pack(fill="x", pady=2)
+    def build_monitor_palette(self):
+        self.wall = ScreenWall(self.palette, self)
+        self.wall.sync(self.all_agents())
+        if self.monitor_selected_keys:
+            self.wall.select_keys(self.monitor_selected_keys)
+        else:
+            self.wall.select(self.selected_agent)
+        return self.wall
 
-        row2 = ctk.CTkFrame(btns, fg_color="transparent")
-        row2.pack(fill="x")
-        ctk.CTkButton(row2, text="🖥  View", height=28, width=90,
-                       fg_color=CARD, hover_color=CARD_SEL,
-                       command=self._open_remote_view).pack(side="left", padx=(0, 2))
-        ctk.CTkButton(row2, text="✕  Remove", height=28,
-                       fg_color=CARD, hover_color="#3d1a1a", text_color=RED,
-                       command=self._remove_selected).pack(side="left", fill="x", expand=True, padx=(2, 0))
+    def build_workflow_palette(self):
+        c = self.colors
+        frame = ctk.CTkFrame(self.palette, fg_color="transparent")
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(1, weight=1)
+        bar = ctk.CTkFrame(frame, fg_color="transparent")
+        bar.grid(row=0, column=0, sticky="ew", padx=22, pady=(18, 12))
+        bar.grid_columnconfigure(1, weight=1)
+        self.workflow_name = _entry(bar, self, "워크플로우 이름", width=190)
+        self.workflow_name.grid(row=0, column=0, padx=(0, 8))
+        self.workflow_var = tk.StringVar(value=self.workflow_names()[0])
+        self.workflow_menu = ctk.CTkOptionMenu(bar, variable=self.workflow_var, values=self.workflow_names(), fg_color=c["panel"], button_color=c["blue"], dropdown_fg_color=c["panel"], command=lambda _v: self.load_workflow())
+        self.workflow_menu.grid(row=0, column=1, sticky="ew", padx=8)
+        _button(bar, self, "저장", self.save_workflow, width=78, color=c["green"], text_color="#07140d").grid(row=0, column=2, padx=4)
+        _button(bar, self, "삭제", self.delete_workflow, width=78, color=c["red"]).grid(row=0, column=3, padx=4)
 
-        ctk.CTkFrame(sb, height=1, fg_color=BORDER).grid(
-            row=5, column=0, sticky="ew", padx=12, pady=4)
+        self.step_scroll = ctk.CTkScrollableFrame(frame, fg_color="transparent", scrollbar_button_color=c["stroke"], scrollbar_button_hover_color=c["hover"])
+        self.step_scroll.grid(row=1, column=0, sticky="nsew", padx=22)
+        self.step_scroll.grid_columnconfigure(0, weight=1)
 
-        # 자동 재연결 토글
-        ar_row = ctk.CTkFrame(sb, fg_color="transparent")
-        ar_row.grid(row=6, column=0, sticky="ew", padx=14, pady=(4, 14))
-        ctk.CTkLabel(ar_row, text="Auto-Reconnect",
-                      font=ctk.CTkFont(size=10), text_color=MUTED).pack(side="left")
-        self._ar_switch = ctk.CTkSwitch(ar_row, text="", width=36,
-                                         onvalue=True, offvalue=False,
-                                         progress_color=GREEN)
-        self._ar_switch.select()
-        self._ar_switch.pack(side="right")
+        runbar = _section(frame, self)
+        runbar.grid(row=2, column=0, sticky="ew", padx=22, pady=(12, 0))
+        runbar.grid_columnconfigure(8, weight=1)
+        ctk.CTkLabel(runbar, text="반복", text_color=c["muted"]).grid(row=0, column=0, padx=(14, 6), pady=12)
+        self.repeat_var = tk.StringVar(value="1")
+        ctk.CTkEntry(runbar, textvariable=self.repeat_var, width=64, fg_color=c["bg"], border_color=c["stroke"], text_color=c["text"]).grid(row=0, column=1, padx=(0, 12), pady=12)
+        ctk.CTkLabel(runbar, text="PC별 랜덤 지연(초)", text_color=c["muted"]).grid(row=0, column=2, padx=(4, 6), pady=12)
+        self.delay_min_entry = _entry(runbar, self, "최소", width=72)
+        self.delay_max_entry = _entry(runbar, self, "최대", width=72)
+        self.delay_min_entry.insert(0, _format_seconds(_ms_to_seconds(self.cfg.get("delay_min_ms", 0))))
+        self.delay_max_entry.insert(0, _format_seconds(_ms_to_seconds(self.cfg.get("delay_max_ms", 0))))
+        self.delay_min_entry.grid(row=0, column=3, padx=4, pady=12)
+        self.delay_max_entry.grid(row=0, column=4, padx=4, pady=12)
+        _button(runbar, self, "실행", self.run_workflow, width=92, color=c["green"], text_color="#07140d").grid(row=0, column=5, padx=4, pady=12)
+        _button(runbar, self, "중지", self.stop_workflow, width=92, color=c["red"]).grid(row=0, column=6, padx=4, pady=12)
+        self.workflow_status = ctk.CTkLabel(runbar, text="", text_color=c["muted"], anchor="w")
+        self.workflow_status.grid(row=0, column=8, sticky="ew", padx=12)
 
-    # ── 메인 패널 ─────────────────────────────────────────────────
+        addbar = ctk.CTkFrame(frame, fg_color="transparent")
+        addbar.grid(row=3, column=0, sticky="ew", padx=22, pady=(12, 18))
+        self.add_action_var = tk.StringVar(value="대기")
+        ctk.CTkOptionMenu(addbar, variable=self.add_action_var, values=ACTION_TYPES, width=150, fg_color=c["panel"], button_color=c["blue"]).pack(side="left")
+        _button(addbar, self, "단계 추가", self.add_step, width=110).pack(side="left", padx=8)
+        _button(addbar, self, "초기화", self.reset_workflow, width=90, color=c["panel2"]).pack(side="left")
 
-    def _build_main(self):
-        main = ctk.CTkFrame(self.root, fg_color=BG, corner_radius=0)
-        main.grid(row=0, column=1, sticky="nsew", padx=0, pady=0)
-        main.rowconfigure(0, weight=1)
-        main.columnconfigure(0, weight=1)
+        self.load_initial_workflow()
+        return frame
 
-        tabs = ctk.CTkTabview(main, fg_color=PANEL,
-                               segmented_button_fg_color=CARD,
-                               segmented_button_selected_color=BLUE,
-                               segmented_button_selected_hover_color="#4a8fd4",
-                               segmented_button_unselected_color=CARD,
-                               segmented_button_unselected_hover_color=CARD_SEL,
-                               text_color=TEXT,
-                               border_width=0,
-                               corner_radius=0)
-        tabs.grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
+    def connect_from_form(self):
+        if self.debug_agents:
+            agent = self.add_debug_agent()
+            self.select_agent(agent)
+            self.set_status(f"{agent.label} 추가됨")
+            self.refresh_all()
+            return
+        host = self.host_entry.get().strip()
+        if not host:
+            self.set_status("IP 또는 호스트를 입력하세요.")
+            return
+        port = _int(self.port_entry.get(), DEFAULT_PORT)
+        agent = self.manager.add(host, port)
+        self.select_agent(agent)
+        self.save_agent_list()
+        threading.Thread(target=lambda: (agent.connect(timeout=3.0), self.root.after(0, self.refresh_all)), daemon=True).start()
 
-        tabs.add("  Keyboard  ")
-        tabs.add("  Mouse  ")
-        tabs.add("  Script  ")
-        tabs.add("  Settings  ")
+    def rebuild_agent_cards(self):
+        if not hasattr(self, "agent_list"):
+            return
+        agents = self.all_agents()
+        keys = [_agent_key(agent) for agent in agents]
+        if keys == self._agent_card_keys and len(self.cards) == len(agents):
+            for card, agent in zip(self.cards, agents):
+                card.agent = agent
+            self.refresh_agent_cards()
+            return
+        for child in self.agent_list.winfo_children():
+            child.destroy()
+        self.cards.clear()
+        for agent in agents:
+            card = AgentCard(self.agent_list, self, agent)
+            card.grid(row=len(self.cards), column=0, sticky="ew", padx=2, pady=5)
+            self.cards.append(card)
+        self._agent_card_keys = keys
+        self.refresh_agent_cards()
 
-        self._build_keyboard_tab(tabs.tab("  Keyboard  "))
-        self._build_mouse_tab(tabs.tab("  Mouse  "))
-        self._build_script_tab(tabs.tab("  Script  "))
-        self._build_settings_tab(tabs.tab("  Settings  "))
+    def refresh_agent_cards(self):
+        for card in self.cards:
+            card.refresh(card.agent is self.selected_agent)
 
-    # ── 탭: Keyboard ──────────────────────────────────────────────
+    def select_monitor_agent(self, agent, multi: bool = False):
+        key = _agent_key(agent)
+        if not key:
+            return
+        self.selected_agent = agent
+        if multi:
+            if key in self.monitor_selected_keys:
+                self.monitor_selected_keys.remove(key)
+            else:
+                self.monitor_selected_keys.add(key)
+        else:
+            self.monitor_selected_keys = {key}
+        self.refresh_agent_cards()
+        if self.wall is not None and self.wall.winfo_exists():
+            self.wall.select_keys(self.monitor_selected_keys)
 
-    def _build_keyboard_tab(self, parent):
-        parent.columnconfigure(0, weight=1)
+    def select_agent(self, agent):
+        self.selected_agent = agent
+        key = _agent_key(agent)
+        if key:
+            self.monitor_selected_keys = {key}
+        self.refresh_agent_cards()
+        if self.wall is not None and self.wall.winfo_exists():
+            self.wall.select_keys(self.monitor_selected_keys)
 
-        # 입력 섹션
-        inp = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=10)
-        inp.pack(fill="x", padx=16, pady=(16, 8))
-        inp.columnconfigure(1, weight=1)
+    def get_monitor_name(self, agent) -> str:
+        key = _agent_key(agent)
+        return self.monitor_names.get(key) or str(agent)
 
-        _lbl(inp, "VK Code").grid(row=0, column=0, sticky="w", padx=14, pady=(12, 4))
-        self._vk_entry = _entry(inp, "0x41", width=120)
-        self._vk_entry.grid(row=0, column=1, sticky="w", padx=8, pady=(12, 4))
-        _lbl(inp, "hex — e.g. 0x41 = A", small=True).grid(
-            row=0, column=2, sticky="w", padx=4, pady=(12, 4))
+    def set_monitor_name(self, agent, name: str):
+        key = _agent_key(agent)
+        if not key:
+            return
+        clean = name.strip() or str(agent)
+        if clean == str(agent):
+            self.monitor_names.pop(key, None)
+        else:
+            self.monitor_names[key] = clean
+        self.cfg["monitor_names"] = self.monitor_names
+        save_config(self.cfg)
+        if self.wall is not None and self.wall.winfo_exists():
+            tile = self.wall._tiles.get(key)
+            if tile is not None:
+                tile.refresh_name()
 
-        _lbl(inp, "Modifiers").grid(row=1, column=0, sticky="w", padx=14, pady=(4, 12))
-        self._mod_entry = _entry(inp, "ctrl, shift, alt, win", width=220)
-        self._mod_entry.grid(row=1, column=1, columnspan=2, sticky="w",
-                              padx=8, pady=(4, 12))
+    def move_monitor_tile(self, agent, direction: int):
+        key = _agent_key(agent)
+        if key not in self.monitor_order:
+            return
+        idx = self.monitor_order.index(key)
+        new_idx = max(0, min(len(self.monitor_order) - 1, idx + direction))
+        if new_idx == idx:
+            return
+        self.monitor_order[idx], self.monitor_order[new_idx] = self.monitor_order[new_idx], self.monitor_order[idx]
+        self.cfg["monitor_order"] = self.monitor_order
+        save_config(self.cfg)
+        if self.wall is not None and self.wall.winfo_exists():
+            self.wall._layout()
+            self.wall.select_keys(self.monitor_selected_keys)
 
-        # 액션 버튼
-        act = ctk.CTkFrame(parent, fg_color="transparent")
-        act.pack(fill="x", padx=16, pady=4)
-        _action_btn(act, "PRESS",   BLUE,  self._key_press).pack(side="left", padx=(0, 6))
-        _action_btn(act, "RELEASE", CARD,  self._key_release).pack(side="left", padx=(0, 6))
-        _action_btn(act, "TAP",     GREEN, self._key_tap,
-                    text_color="#0d1117").pack(side="left")
+    def reorder_monitor_tile_to_point(self, agent, x_root: int, y_root: int):
+        if self.wall is not None and self.wall.winfo_exists():
+            self.wall.reorder_tile_to_point(agent, x_root, y_root)
 
-        # 구분선
-        ctk.CTkFrame(parent, height=1, fg_color=BORDER).pack(
-            fill="x", padx=16, pady=12)
+    def disconnect_agent(self, agent):
+        if getattr(agent, "is_debug", False):
+            if agent in self.debug_agents:
+                self.debug_agents.remove(agent)
+                self.debug_logs.append(f"Debug agent removed: {agent.label}")
+            if self.selected_agent is agent:
+                self.selected_agent = self.debug_agents[0] if self.debug_agents else None
+            self.debug_badge.configure(text=f"DEBUG MODE ({len(self.debug_agents)})" if self.debug_agents else "")
+            self.refresh_all()
+            return
+        self.manager.remove(agent.host, agent.port)
+        if self.selected_agent is agent:
+            self.selected_agent = None
+        self.save_agent_list()
+        self.refresh_all()
 
-        # 퀵 키
-        _lbl(parent, "QUICK KEYS", small=True).pack(anchor="w", padx=18, pady=(0, 6))
-
-        qf = ctk.CTkFrame(parent, fg_color="transparent")
-        qf.pack(fill="x", padx=14)
-
-        quick = [
-            ("Enter",    0x0D, []),  ("Esc",      0x1B, []),
-            ("Tab",      0x09, []),  ("Space",    0x20, []),
-            ("Del",      0x2E, []),  ("↑",        0x26, []),
-            ("↓",        0x28, []),  ("←",        0x25, []),
-            ("→",        0x27, []),  ("Ctrl+C",   0x43, ["ctrl"]),
-            ("Ctrl+V",   0x56, ["ctrl"]), ("Ctrl+Z",   0x5A, ["ctrl"]),
-            ("Ctrl+A",   0x41, ["ctrl"]), ("Ctrl+S",   0x53, ["ctrl"]),
-            ("Win+D",    0x44, ["win"]),  ("Alt+F4",   0x73, ["alt"]),
-        ]
-        for i, (label, vk, mods) in enumerate(quick):
-            ctk.CTkButton(
-                qf, text=label, width=64, height=28,
-                fg_color=CARD, hover_color=CARD_SEL, text_color=TEXT,
-                font=ctk.CTkFont(family="Consolas", size=10), corner_radius=6,
-                command=lambda v=vk, m=mods: self._quick_tap(v, m)
-            ).grid(row=i // 8, column=i % 8, padx=3, pady=3)
-
-    # ── 탭: Mouse ─────────────────────────────────────────────────
-
-    def _build_mouse_tab(self, parent):
-        # 좌표 이동
-        move = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=10)
-        move.pack(fill="x", padx=16, pady=(16, 8))
-
-        _lbl(move, "ABSOLUTE MOVE").grid(
-            row=0, column=0, columnspan=4, sticky="w", padx=14, pady=(12, 6))
-
-        _lbl(move, "X").grid(row=1, column=0, padx=(14, 4), pady=(0, 12))
-        self._mx = _entry(move, "960", width=90)
-        self._mx.grid(row=1, column=1, padx=4, pady=(0, 12))
-        _lbl(move, "Y").grid(row=1, column=2, padx=4, pady=(0, 12))
-        self._my = _entry(move, "540", width=90)
-        self._my.grid(row=1, column=3, padx=4, pady=(0, 12))
-        _action_btn(move, "MOVE", BLUE, self._mouse_move, width=80).grid(
-            row=1, column=4, padx=12, pady=(0, 12))
-
-        # 클릭
-        click = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=10)
-        click.pack(fill="x", padx=16, pady=8)
-        _lbl(click, "CLICK").grid(row=0, column=0, sticky="w",
-                                   padx=14, pady=(12, 8))
-        bf = ctk.CTkFrame(click, fg_color="transparent")
-        bf.grid(row=1, column=0, padx=10, pady=(0, 12))
-        for label, btn in [("Left", "left"), ("Right", "right"), ("Middle", "middle")]:
-            _action_btn(bf, label, CARD if label != "Left" else BLUE,
-                         lambda b=btn: self._mouse_click(b), width=90).pack(
-                             side="left", padx=4)
-
-        # 스크롤
-        scroll = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=10)
-        scroll.pack(fill="x", padx=16, pady=8)
-        _lbl(scroll, "SCROLL").grid(row=0, column=0, sticky="w",
-                                     padx=14, pady=(12, 8))
-        sf = ctk.CTkFrame(scroll, fg_color="transparent")
-        sf.grid(row=1, column=0, padx=10, pady=(0, 12))
-        self._scroll_delta = _entry(sf, "120", width=80)
-        self._scroll_delta.pack(side="left", padx=(0, 8))
-        _action_btn(sf, "▲ Up",   CARD, lambda: self._scroll(1),  width=80).pack(side="left", padx=3)
-        _action_btn(sf, "▼ Down", CARD, lambda: self._scroll(-1), width=80).pack(side="left", padx=3)
-
-    # ── 탭: Script ────────────────────────────────────────────────
-
-    def _build_script_tab(self, parent):
-        parent.rowconfigure(1, weight=1)
-        parent.columnconfigure(0, weight=1)
-
-        # 헤더
-        hdr = ctk.CTkFrame(parent, fg_color="transparent")
-        hdr.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 4))
-        _lbl(hdr, "COMMAND SCRIPT").pack(side="left")
-        ctk.CTkLabel(hdr,
-            text="key_tap <VK>  ·  mouse_move <x> <y>  ·  mouse_click <left|right>  ·  delay <ms>",
-            font=ctk.CTkFont(family="Consolas", size=9), text_color=MUTED
-        ).pack(side="left", padx=16)
-
-        # 텍스트 에디터
-        self._script = ctk.CTkTextbox(
-            parent, font=ctk.CTkFont(family="Consolas", size=11),
-            fg_color=CARD, text_color=TEXT,
-            border_color=BORDER, border_width=1, corner_radius=8)
-        self._script.grid(row=1, column=0, sticky="nsew", padx=16, pady=4)
-        self._script.insert("end",
-            "# Command Script\n"
-            "# 주석은 # 으로 시작\n\n"
-            "delay 500\n"
-            "mouse_move 960 540\n"
-            "mouse_click left\n"
-            "delay 200\n"
-            "key_tap 0x52\n"   # R
+    def open_monitor(self, agent):
+        from ui.remote_view import RemoteViewWindow
+        RemoteViewWindow(
+            agent,
+            self.secret,
+            followers=[] if getattr(agent, "is_debug", False) else self.mirror_targets(agent),
+            workflows_provider=lambda: self.reload_workflows_from_disk(update_ui=False),
+            workflow_runner=lambda name, agents: self.run_saved_workflow_for_agents(name, agents),
         )
 
-        # 실행 컨트롤
-        ctrl = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=8)
-        ctrl.grid(row=2, column=0, sticky="ew", padx=16, pady=(4, 14))
-        ctrl.columnconfigure(2, weight=1)
+    def mirror_targets(self, primary) -> list:
+        return [a for a in self.all_agents() if a is not primary and getattr(a, "is_connected", False)]
 
-        _lbl(ctrl, "Repeat").grid(row=0, column=0, padx=(14, 4), pady=10)
-        self._repeat_var = ctk.StringVar(value="1")
-        ctk.CTkEntry(ctrl, textvariable=self._repeat_var, width=60,
-                      fg_color=BG, border_color=BORDER,
-                      font=ctk.CTkFont(family="Consolas")).grid(
-                          row=0, column=1, padx=4, pady=10)
+    def toggle_debug(self, force: Optional[bool] = None):
+        enable = (not self.debug_agents) if force is None else force
+        if enable and not self.debug_agents:
+            agent = self.add_debug_agent()
+            self.debug_logs.append("Debug mode enabled")
+            self.select_agent(agent)
+        elif not enable and self.debug_agents:
+            self.debug_logs.append("Debug mode disabled")
+            self.debug_agents.clear()
+            if getattr(self.selected_agent, "is_debug", False):
+                self.selected_agent = None
+        self.debug_badge.configure(text=f"DEBUG MODE ({len(self.debug_agents)})" if self.debug_agents else "")
+        self.refresh_all(force=True)
 
-        _action_btn(ctrl, "▶  RUN", GREEN, self._run_script,
-                     text_color="#0d1117").grid(row=0, column=3, padx=4, pady=10)
-        _action_btn(ctrl, "■  STOP", RED, self._stop_script, width=80).grid(
-            row=0, column=4, padx=(0, 14), pady=10)
+    def toggle_theme(self):
+        self.theme_name = "light" if self.theme_name == "dark" else "dark"
+        self.colors = THEMES.get(self.theme_name, THEMES["dark"])
+        self.cfg["theme"] = self.theme_name
+        save_config(self.cfg)
+        self.apply_theme_colors()
+        self.set_status("테마 변경됨")
 
-        # 진행 표시
-        self._script_status = ctk.CTkLabel(
-            ctrl, text="", font=ctk.CTkFont(family="Consolas", size=10),
-            text_color=MUTED)
-        self._script_status.grid(row=0, column=2, sticky="ew")
+    def apply_theme_colors(self):
+        c = self.colors
+        self.root.configure(fg_color=c["bg"])
+        if hasattr(self, "left"):
+            self.left.configure(fg_color=c["surface"])
+        if hasattr(self, "topbar"):
+            self.topbar.configure(fg_color=c["bg"])
+        if hasattr(self, "palette"):
+            self.palette.configure(fg_color=c["bg"])
+        if hasattr(self, "title"):
+            self.title.configure(text_color=c["text"])
+        if hasattr(self, "status"):
+            self.status.configure(fg_color=c["surface"], text_color=c["muted"])
+        if hasattr(self, "debug_badge"):
+            self.debug_badge.configure(text_color=c["yellow"])
+        if hasattr(self, "theme_button"):
+            self.theme_button.configure(text=self.theme_icon(), fg_color=c["panel2"], hover_color=c["hover"], text_color=c["yellow"])
+        for name in ("연결", "워크플로우"):
+            frame = self.palette_frames.pop(name, None)
+            if frame is not None and frame.winfo_exists():
+                frame.destroy()
+        self.cards.clear()
+        self._agent_card_keys.clear()
+        self.workflow_rows.clear()
+        for key, btn in getattr(self, "nav_buttons", {}).items():
+            btn.configure(
+                fg_color=c["panel2"] if key == self.current_palette else "transparent",
+                hover_color=c["hover"],
+                text_color=c["text"],
+            )
+        if getattr(self, "status_dock", None) is not None:
+            self.status_dock.refresh(self.all_agents())
+        if self.settings_dropdown is not None and self.settings_dropdown.winfo_exists():
+            self.settings_dropdown.configure(fg_color=c["surface"], border_color=c["stroke"])
+        if self.wall is not None and self.wall.winfo_exists():
+            self.wall.apply_theme()
+        if self.current_palette != "모니터링":
+            self.show_palette(self.current_palette)
 
-    # ── 탭: Settings ──────────────────────────────────────────────
+    def rebuild_shell(self):
+        current = self.current_palette
+        selected_keys = set(self.monitor_selected_keys)
+        if self.wall is not None:
+            self.wall.stop_all()
+            self.wall = None
+        if self.settings_dropdown is not None and self.settings_dropdown.winfo_exists():
+            self.settings_dropdown.destroy()
+            self.settings_dropdown = None
+        for child in self.root.winfo_children():
+            child.destroy()
+        self.cards.clear()
+        self._agent_card_keys.clear()
+        self.palette_frames.clear()
+        self.workflow_rows.clear()
+        self.root.configure(fg_color=self.colors["bg"])
+        self.build_left_panel()
+        self.build_topbar()
+        self.palette = ctk.CTkFrame(self.root, fg_color=self.colors["bg"], corner_radius=0)
+        self.palette.grid(row=1, column=1, sticky="nsew")
+        self.palette.grid_columnconfigure(0, weight=1)
+        self.palette.grid_rowconfigure(0, weight=1)
+        self.status = ctk.CTkLabel(self.root, text="준비됨", anchor="w", fg_color=self.colors["surface"], text_color=self.colors["muted"], height=30)
+        self.status.grid(row=2, column=0, columnspan=2, sticky="ew")
+        self.monitor_selected_keys = selected_keys
+        self.show_palette(current)
 
-    def _build_settings_tab(self, parent):
-        card = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=10)
-        card.pack(fill="x", padx=16, pady=16)
-        card.columnconfigure(1, weight=1)
-
-        _lbl(card, "SECURITY").grid(
-            row=0, column=0, columnspan=3, sticky="w", padx=14, pady=(12, 8))
-
-        _lbl(card, "Shared Secret").grid(row=1, column=0, sticky="w", padx=14, pady=4)
-        self._secret_entry = ctk.CTkEntry(
-            card, show="●", placeholder_text="encryption key",
-            fg_color=BG, border_color=BORDER,
-            font=ctk.CTkFont(family="Consolas"))
-        self._secret_entry.insert(0, self._secret)
-        self._secret_entry.grid(row=1, column=1, sticky="ew", padx=8, pady=4)
-        _action_btn(card, "Apply", BLUE, self._apply_secret,
-                     width=70, height=28).grid(row=1, column=2, padx=(4, 14), pady=4)
-
-        ctk.CTkFrame(card, height=1, fg_color=BORDER).grid(
-            row=2, column=0, columnspan=3, sticky="ew", padx=14, pady=8)
-
-        _lbl(card, "STREAMING").grid(
-            row=3, column=0, columnspan=3, sticky="w", padx=14, pady=(4, 8))
-
-        _lbl(card, "Target FPS").grid(row=4, column=0, sticky="w", padx=14, pady=4)
-        self._fps_label = ctk.CTkLabel(card, text="10",
-                                        font=ctk.CTkFont(family="Consolas"),
-                                        text_color=GREEN, width=30)
-        self._fps_label.grid(row=4, column=2, padx=(0, 14), pady=4)
-        fps_slider = ctk.CTkSlider(
-            card, from_=1, to=30, number_of_steps=29,
-            progress_color=BLUE, button_color=BLUE, button_hover_color="#4a8fd4",
-            command=lambda v: self._fps_label.configure(text=str(int(v))))
-        fps_slider.set(self._cfg.get("fps", 10))
-        fps_slider.grid(row=4, column=1, sticky="ew", padx=8, pady=4)
-        self._fps_slider = fps_slider
-
-        ctk.CTkFrame(card, height=1, fg_color=BORDER).grid(
-            row=5, column=0, columnspan=3, sticky="ew", padx=14, pady=8)
-
-        _action_btn(card, "  Save Settings", GREEN, self._save_settings,
-                     text_color="#0d1117", height=32).grid(
-                         row=6, column=0, columnspan=3, padx=14, pady=(0, 14))
-
-    # ── 상태바 ────────────────────────────────────────────────────
-
-    def _build_statusbar(self):
-        bar = ctk.CTkFrame(self.root, fg_color=PANEL, height=28, corner_radius=0)
-        bar.grid(row=1, column=0, columnspan=2, sticky="ew")
-        bar.grid_propagate(False)
-
-        self._stat_conn = ctk.CTkLabel(
-            bar, text="◉  0 connected",
-            font=ctk.CTkFont(family="Consolas", size=10), text_color=MUTED)
-        self._stat_conn.pack(side="left", padx=14)
-
-        ctk.CTkFrame(bar, width=1, fg_color=BORDER).pack(side="left", fill="y", pady=4)
-
-        self._stat_msg = ctk.CTkLabel(
-            bar, text="Ready",
-            font=ctk.CTkFont(family="Consolas", size=10), text_color=MUTED)
-        self._stat_msg.pack(side="left", padx=14)
-
-    # ────────────────────────────────────────────────────────────────
-    #  에이전트 관리
-    # ────────────────────────────────────────────────────────────────
-
-    def _show_connect_dialog(self):
-        dlg = ctk.CTkToplevel(self.root)
-        dlg.title("Connect Agent")
-        dlg.geometry("320x160")
-        dlg.configure(fg_color=PANEL)
-        dlg.grab_set()
-        dlg.resizable(False, False)
-
-        ctk.CTkLabel(dlg, text="Host / IP", font=ctk.CTkFont(size=11),
-                      text_color=MUTED).grid(row=0, column=0, padx=16, pady=(16, 4), sticky="w")
-        host_e = ctk.CTkEntry(dlg, placeholder_text="192.168.1.100",
-                               fg_color=BG, border_color=BORDER,
-                               font=ctk.CTkFont(family="Consolas"))
-        host_e.grid(row=1, column=0, padx=16, pady=4, sticky="ew")
-
-        ctk.CTkLabel(dlg, text="Port", font=ctk.CTkFont(size=11),
-                      text_color=MUTED).grid(row=0, column=1, padx=(4, 16), pady=(16, 4), sticky="w")
-        port_e = ctk.CTkEntry(dlg, placeholder_text="9000", width=70,
-                               fg_color=BG, border_color=BORDER,
-                               font=ctk.CTkFont(family="Consolas"))
-        port_e.grid(row=1, column=1, padx=(4, 16), pady=4)
-        dlg.columnconfigure(0, weight=1)
-
-        def do_connect():
-            host = host_e.get().strip()
-            port = int(port_e.get().strip() or "9000")
-            dlg.destroy()
-            agent = self.manager.add(host, port)
-            agent.auto_reconnect = self._ar_switch.get()
-            agent.connect()
-            self._add_card(agent)
-            self._save_agent_list()
-            self._status(f"Connecting to {agent}…")
-
-        ctk.CTkButton(dlg, text="Connect", fg_color=GREEN, hover_color="#2ea043",
-                       text_color="#0d1117", font=ctk.CTkFont(weight="bold"),
-                       command=do_connect).grid(
-                           row=2, column=0, columnspan=2,
-                           padx=16, pady=(8, 16), sticky="ew")
-        host_e.focus()
-        dlg.bind("<Return>", lambda _: do_connect())
-
-    def _add_card(self, agent: AgentConnection):
-        card = AgentCard(
-            self._agent_scroll, agent,
-            on_select=self._select_card,
-            on_view=lambda a: self._open_remote_view_for(a))
-        card.grid(row=len(self._cards), column=0, sticky="ew",
-                  padx=2, pady=3)
-        self._cards.append(card)
-
-    def _select_card(self, card: AgentCard):
-        if self._sel:
-            self._sel.set_selected(False)
-        self._sel = card
-        card.set_selected(True)
-
-    def _remove_selected(self):
-        if not self._sel:
+    def open_settings(self):
+        if self.settings_dropdown is not None and self.settings_dropdown.winfo_exists():
+            self.settings_dropdown.destroy()
+            self.settings_dropdown = None
             return
-        agent = self._sel.agent
-        self.manager.remove(agent.host, agent.port)
-        self._sel.destroy()
-        self._cards.remove(self._sel)
-        self._sel = None
-        self._save_agent_list()
-        self._status(f"Removed agent")
+        c = self.colors
+        panel = ctk.CTkFrame(self.root, fg_color=c["surface"], corner_radius=12, border_width=1, border_color=c["stroke"])
+        panel.place(relx=1.0, y=62, x=-228, anchor="ne")
+        self.settings_dropdown = panel
+        head = ctk.CTkFrame(panel, fg_color="transparent")
+        head.pack(fill="x", padx=14, pady=(12, 4))
+        ctk.CTkLabel(head, text="설정", font=ctk.CTkFont(size=16, weight="bold"), text_color=c["text"]).pack(side="left")
+        _mini_button(head, self, "X", lambda: self.open_settings(), width=30, color=c["panel2"]).pack(side="right")
+        ctk.CTkLabel(panel, text=f"워크플로우 폴더\n{FLOWS_DIR}", justify="left", text_color=c["muted"]).pack(anchor="w", padx=14, pady=(4, 10))
+        _button(panel, self, "워크플로우 다시 불러오기", self.reload_workflows_from_disk, width=190, color=c["panel2"]).pack(anchor="w", padx=14, pady=(0, 12))
+        if self.debug_agents:
+            ctk.CTkLabel(panel, text="Debug 로그", text_color=c["yellow"]).pack(anchor="w", padx=14, pady=(4, 4))
+            box = ctk.CTkTextbox(panel, width=360, height=120, fg_color=c["panel"], text_color=c["text"])
+            box.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+            box.insert("end", "\n".join(self.debug_logs[-50:]))
 
-    def _refresh_cards(self):
-        n = self.manager.connected_count
-        self._stat_conn.configure(
-            text=f"◉  {n} connected",
-            text_color=GREEN if n > 0 else MUTED)
-        for card in self._cards:
-            card.refresh()
-
-    def _tick(self):
-        self._refresh_cards()
-        self.root.after(1500, self._tick)
-
-    def _open_remote_view(self):
-        if not self._sel:
-            self._status("Select an agent first")
+    def add_step(self, step: Optional[dict] = None):
+        if not hasattr(self, "step_scroll"):
             return
-        self._open_remote_view_for(self._sel.agent)
+        step = step or {"type": self.add_action_var.get()}
+        row = WorkflowStepRow(self.step_scroll, self, len(self.workflow_rows), step)
+        row.grid(row=len(self.workflow_rows), column=0, sticky="ew", padx=2, pady=5)
+        self.workflow_rows.append(row)
 
-    def _open_remote_view_for(self, agent: AgentConnection):
-        if not agent.is_connected:
-            self._status("Agent is offline")
+    def delete_step(self, row: WorkflowStepRow):
+        self.workflow_rows.remove(row)
+        row.destroy()
+        self.renumber_steps()
+
+    def move_step(self, row: WorkflowStepRow, delta: int):
+        idx = self.workflow_rows.index(row)
+        new = idx + delta
+        if 0 <= new < len(self.workflow_rows):
+            self.workflow_rows[idx], self.workflow_rows[new] = self.workflow_rows[new], self.workflow_rows[idx]
+            self.renumber_steps()
+
+    def renumber_steps(self):
+        for idx, row in enumerate(self.workflow_rows):
+            row.renumber(idx)
+            row.grid(row=idx, column=0, sticky="ew", padx=2, pady=5)
+
+    def workflow_steps(self) -> list[dict]:
+        return [row.get_step() for row in self.workflow_rows]
+
+    def workflow_names(self) -> list[str]:
+        names = [w.get("name", "") for w in self.cfg.get("workflows", []) if w.get("name")]
+        return names or ["새 워크플로우"]
+
+    def reload_workflows_from_disk(self, update_ui: bool = True) -> list[dict]:
+        disk_workflows = load_workflows()
+        if disk_workflows:
+            self.cfg["workflows"] = disk_workflows
+        else:
+            self.cfg["workflows"] = self.cfg.get("workflows", [])
+        if update_ui:
+            if hasattr(self, "workflow_menu"):
+                self.workflow_menu.configure(values=self.workflow_names())
+                self.workflow_var.set(self.workflow_names()[0])
+            if self.wall is not None and self.wall.winfo_exists():
+                self.wall.refresh_workflows()
+            self.set_status(f"워크플로우 불러옴: {len(self.cfg['workflows'])}개")
+        return self.cfg["workflows"]
+
+    def load_initial_workflow(self):
+        if self.cfg.get("workflows"):
+            self.load_workflow(self.cfg["workflows"][0].get("name"))
+        else:
+            for step in default_workflow():
+                self.add_step(step)
+
+    def load_workflow(self, name: Optional[str] = None):
+        name = name or self.workflow_var.get()
+        for wf in self.cfg.get("workflows", []):
+            if wf.get("name") == name:
+                self.reset_workflow(empty=True)
+                self.workflow_name.delete(0, "end")
+                self.workflow_name.insert(0, name)
+                for step in wf.get("steps", []):
+                    self.add_step(step)
+
+    def save_workflow(self):
+        name = self.workflow_name.get().strip() or self.workflow_var.get().strip()
+        if not name or name == "새 워크플로우":
+            self.set_status("워크플로우 이름을 입력하세요.")
             return
-        from ui.remote_view import RemoteViewWindow
-        RemoteViewWindow(agent, self._secret)
-        self._status(f"Remote View: {agent}")
+        save_workflow_file({"name": name, "steps": self.workflow_steps()})
+        self.reload_workflows_from_disk(update_ui=False)
+        self.workflow_menu.configure(values=self.workflow_names())
+        self.workflow_var.set(name)
+        self.save_settings(silent=True)
+        if self.wall is not None and self.wall.winfo_exists():
+            self.wall.refresh_workflows()
+        self.set_status(f"워크플로우 저장됨: {name} ({FLOWS_DIR})")
 
-    # ────────────────────────────────────────────────────────────────
-    #  HID 명령
-    # ────────────────────────────────────────────────────────────────
+    def delete_workflow(self):
+        name = self.workflow_var.get()
+        delete_workflow_file(name)
+        self.cfg["workflows"] = [w for w in self.cfg.get("workflows", []) if w.get("name") != name]
+        self.workflow_menu.configure(values=self.workflow_names())
+        self.workflow_var.set(self.workflow_names()[0])
+        self.save_settings(silent=True)
+        if self.wall is not None and self.wall.winfo_exists():
+            self.wall.refresh_workflows()
 
-    def _key_press(self):
-        vk, mods = self._parse_kb()
-        if vk is None: return
-        self.manager.broadcast(Command.key_press(vk, mods))
-        self._status(f"Key press  0x{vk:02X}  {mods or ''}")
+    def reset_workflow(self, empty: bool = False):
+        for row in self.workflow_rows:
+            row.destroy()
+        self.workflow_rows.clear()
+        if not empty:
+            for step in default_workflow():
+                self.add_step(step)
 
-    def _key_release(self):
-        vk, mods = self._parse_kb()
-        if vk is None: return
-        self.manager.broadcast(Command.key_release(vk, mods))
-        self._status(f"Key release  0x{vk:02X}")
+    def run_workflow(self):
+        targets = self.targets()
+        if not targets:
+            self.set_status("실행 대상이 없습니다.")
+            return
+        repeat = max(1, _int(self.repeat_var.get(), 1))
+        steps = self.workflow_steps()
+        self.run_steps_for_agents(steps, targets, repeat)
 
-    def _key_tap(self):
-        vk, mods = self._parse_kb()
-        if vk is None: return
-        self.manager.broadcast(Command.key_press(vk, mods))
-        self.manager.broadcast(Command.key_release(vk, mods))
-        self._status(f"Key tap  0x{vk:02X}")
+    def find_workflow(self, name: str) -> Optional[dict]:
+        for wf in self.cfg.get("workflows", []):
+            if wf.get("name") == name:
+                return wf
+        return None
 
-    def _quick_tap(self, vk: int, mods: list):
-        self.manager.broadcast(Command.key_press(vk, mods))
-        self.manager.broadcast(Command.key_release(vk, mods))
-        self._status(f"Quick tap  0x{vk:02X}")
+    def run_monitor_workflow(self, name: str):
+        targets = self.wall.selected_agents() if self.wall is not None and self.wall.winfo_exists() else []
+        if not targets and self.selected_agent and getattr(self.selected_agent, "is_connected", False):
+            targets = [self.selected_agent]
+        self.run_saved_workflow_for_agents(name, targets)
 
-    def _parse_kb(self):
+    def run_saved_workflow_for_agents(self, name: str, agents: list):
+        wf = self.find_workflow(name)
+        if not wf:
+            self.set_status(f"워크플로우를 찾을 수 없습니다: {name}")
+            return
+        targets = [a for a in agents if getattr(a, "is_connected", False)]
+        if not targets:
+            self.set_status("선택된 모니터링 PC가 없습니다.")
+            return
+        repeat = max(1, _int(self.repeat_var.get(), 1)) if hasattr(self, "repeat_var") else 1
+        self.run_steps_for_agents(wf.get("steps", []), targets, repeat)
+        self.set_status(f"{name} 실행: {len(targets)}대")
+
+    def run_steps_for_agents(self, steps: list[dict], agents: list, repeat: int = 1):
+        self.macro_stop = False
+        for agent in agents:
+            threading.Thread(target=self.run_workflow_for_agent, args=(agent, steps, repeat), daemon=True).start()
+
+    def run_workflow_for_agent(self, agent, steps: list[dict], repeat: int):
+        lo, hi = self.delay_range()
+        if hi > 0:
+            time.sleep(random.uniform(lo, hi) / 1000.0)
+        detectors = [s for s in steps if s.get("type") == "이미지 감지"]
+        runnable_steps = [s for s in steps if s.get("type") != "이미지 감지"]
+        detector_stop = threading.Event()
+        agent_stop = threading.Event()
+        detector_threads = [
+            threading.Thread(target=self.run_detector_for_agent, args=(agent, step, detector_stop, agent_stop), daemon=True)
+            for step in detectors
+        ]
+        for thread in detector_threads:
+            thread.start()
+
+        total = max(1, len(runnable_steps) * repeat)
+        done = 0
         try:
-            vk   = int(self._vk_entry.get().strip(), 16)
-            mods = [m.strip() for m in self._mod_entry.get().split(",") if m.strip()]
-            return vk, mods
-        except ValueError:
-            self._status("Invalid VK code")
-            return None, None
+            for _ in range(repeat):
+                for step in runnable_steps:
+                    if self.macro_stop or agent_stop.is_set():
+                        break
+                    self.execute_step(agent, step)
+                    done += 1
+                    pct = int(done / total * 100)
+                    self.root.after(0, lambda p=pct, a=agent: self.update_workflow_progress(a, p))
+                    if hi > 0:
+                        time.sleep(random.uniform(lo, hi) / 1000.0)
+        finally:
+            detector_stop.set()
 
-    def _mouse_move(self):
-        x, y = int(self._mx.get()), int(self._my.get())
-        self.manager.broadcast(Command.mouse_move(x, y))
-        self._status(f"Mouse move  ({x}, {y})")
+    def run_detector_for_agent(self, agent, step: dict, stop_event: threading.Event, agent_stop: threading.Event):
+        interval = max(100, int(_float(step.get("interval"), 500.0))) / 1000.0
+        while not stop_event.is_set() and not self.macro_stop and not agent_stop.is_set():
+            result = self.find_image_for_agent(agent, step, quiet=True)
+            if result and result.get("ok"):
+                action = str(step.get("detect_action", "click"))
+                if action == "click":
+                    x = _int(result.get("x"), 0) + int(_float(step.get("offset_x"), 0))
+                    y = _int(result.get("y"), 0) + int(_float(step.get("offset_y"), 0))
+                    self.natural_move(agent, x, y, 180.0, 1.0)
+                    self.click(agent, "left")
+                elif action == "stop_agent":
+                    agent_stop.set()
+                elif action == "stop_all":
+                    self.macro_stop = True
+                self.root.after(0, lambda a=agent, act=action: self.set_status(f"{a} 이미지 감지 행동: {act}"))
+                break
+            stop_event.wait(interval)
 
-    def _mouse_click(self, button: str):
-        self.manager.broadcast(Command.mouse_down(button))
-        self.manager.broadcast(Command.mouse_up(button))
-        self._status(f"Mouse click  {button}")
+    def update_workflow_progress(self, agent, pct: int):
+        if hasattr(self, "workflow_status") and self.workflow_status.winfo_exists():
+            self.workflow_status.configure(text=f"{agent} {pct}%", text_color=self.colors["green"])
+        self.set_status(f"{agent} 워크플로우 {pct}%")
 
-    def _scroll(self, direction: int):
-        delta = int(self._scroll_delta.get()) * direction
-        self.manager.broadcast(Command.mouse_scroll(delta))
-        self._status(f"Scroll  {delta:+d}")
+    def execute_step(self, agent, step: dict):
+        kind = step.get("type")
+        if kind == "대기":
+            time.sleep(_float(step.get("ms"), 500.0) / 1000.0)
+        elif kind == "키 입력":
+            key_text, key_mods = _parse_key_combo(str(step.get("key", "A")), step.get("mods", ""))
+            self.tap_key(agent, _parse_vk(key_text), key_mods)
+        elif kind == "마우스 이동":
+            s = self.step_for_agent(step, agent)
+            self.move(agent, _int(s.get("x"), 960), _int(s.get("y"), 540))
+        elif kind == "자연 이동":
+            s = self.step_for_agent(step, agent)
+            self.natural_move(agent, _int(s.get("x"), 960), _int(s.get("y"), 540), _float(s.get("duration"), 650.0), _float(s.get("jitter"), 3))
+        elif kind == "클릭":
+            self.click(agent, str(step.get("button", "left")))
+        elif kind == "랜덤 클릭":
+            s = self.step_for_agent(step, agent)
+            x1, y1, x2, y2 = _int(s.get("x1"), 850), _int(s.get("y1"), 450), _int(s.get("x2"), 1070), _int(s.get("y2"), 630)
+            self.natural_move(agent, random.randint(min(x1, x2), max(x1, x2)), random.randint(min(y1, y2), max(y1, y2)), 650.0, 3)
+            self.click(agent, str(step.get("button", "left")))
+        elif kind == "스크롤":
+            agent.send(Command.mouse_scroll(_int(step.get("delta"), -120)))
+        elif kind == "이미지 찾기":
+            found = self.find_image_for_agent(agent, step)
+            if found and found.get("ok"):
+                x = _int(found.get("x"), 0) + int(_float(step.get("offset_x"), 0))
+                y = _int(found.get("y"), 0) + int(_float(step.get("offset_y"), 0))
+                self.natural_move(agent, x, y, 250.0, 1.0)
+                self.click(agent, "left")
+        elif kind == "이미지 대기":
+            self.find_image_for_agent(agent, step)
 
-    # ────────────────────────────────────────────────────────────────
-    #  Script 실행
-    # ────────────────────────────────────────────────────────────────
+    def step_for_agent(self, step: dict, agent) -> dict:
+        overrides = step.get("perAgent") or step.get("per_agent") or {}
+        if not isinstance(overrides, dict):
+            return step
+        key = _agent_key(agent)
+        alt = overrides.get(key) or overrides.get(str(agent))
+        if not isinstance(alt, dict):
+            return step
+        merged = dict(step)
+        merged.update(alt)
+        return merged
 
-    def _run_script(self):
-        self._macro_stop = False
-        lines  = self._script.get("1.0", "end").splitlines()
-        repeat = max(1, int(self._repeat_var.get() or 1))
-        threading.Thread(
-            target=self._script_thread, args=(lines, repeat), daemon=True).start()
+    def find_image_for_agent(self, agent, step: dict, quiet: bool = False) -> Optional[dict]:
+        path = str(step.get("image_path", "")).strip()
+        if not path:
+            if not quiet:
+                self.root.after(0, lambda: self.set_status("이미지 파일 경로가 비어 있습니다."))
+            return None
+        try:
+            image_data = _image_file_to_data_url(path)
+        except Exception as exc:
+            if not quiet:
+                self.root.after(0, lambda e=exc: self.set_status(f"이미지 로드 실패: {e}"))
+            return None
+        if not hasattr(agent, "find_image"):
+            if not quiet:
+                self.root.after(0, lambda: self.set_status("Agent가 이미지 탐색을 지원하지 않습니다."))
+            return None
+        result = agent.find_image(
+            image_data,
+            threshold=max(0.0, min(1.0, _float(step.get("threshold"), 0.92))),
+            timeoutMs=max(100, int(_float(step.get("timeout"), 3000.0))),
+            matchMode=str(step.get("match_mode", "similar")),
+        )
+        if result and result.get("ok"):
+            self.last_positions[_agent_key(agent)] = (_int(result.get("x"), 0), _int(result.get("y"), 0))
+            if not quiet:
+                self.root.after(0, lambda r=result, a=agent: self.set_status(f"{a} 이미지 감지: {r.get('x')}, {r.get('y')} / {r.get('score', '')}"))
+        else:
+            msg = result.get("msg") if isinstance(result, dict) else "응답 없음"
+            if not quiet:
+                self.root.after(0, lambda a=agent, m=msg: self.set_status(f"{a} 이미지 미감지: {m}"))
+        return result
 
-    def _script_thread(self, lines: list[str], repeat: int):
-        total = sum(1 for l in lines if l.strip() and not l.strip().startswith("#"))
-        done  = 0
-        for r in range(repeat):
-            if self._macro_stop: break
-            for line in lines:
-                if self._macro_stop: break
-                line = line.strip()
-                if not line or line.startswith("#"): continue
-                parts = line.split()
-                try:
-                    cmd = parts[0]
-                    if cmd == "key_tap":
-                        vk = int(parts[1], 16)
-                        self.manager.broadcast(Command.key_press(vk))
-                        self.manager.broadcast(Command.key_release(vk))
-                    elif cmd == "mouse_move":
-                        self.manager.broadcast(Command.mouse_move(int(parts[1]), int(parts[2])))
-                    elif cmd == "mouse_click":
-                        b = parts[1] if len(parts) > 1 else "left"
-                        self.manager.broadcast(Command.mouse_down(b))
-                        self.manager.broadcast(Command.mouse_up(b))
-                    elif cmd == "delay":
-                        time.sleep(int(parts[1]) / 1000.0)
-                except Exception as e:
-                    print(f"[Script] '{line}': {e}")
-                done += 1
-                pct = int(done / (total * repeat) * 100)
-                self.root.after(0, lambda p=pct, ri=r+1: self._script_status.configure(
-                    text=f"Run {ri}/{repeat}  ·  {p}%", text_color=GREEN))
-        self.root.after(0, lambda: self._script_status.configure(
-            text="Completed" if not self._macro_stop else "Stopped",
-            text_color=GREEN if not self._macro_stop else YELLOW))
+    def stop_workflow(self):
+        self.macro_stop = True
 
-    def _stop_script(self):
-        self._macro_stop = True
-        self._status("Script stopped")
+    def targets(self) -> list:
+        agents = [a for a in self.all_agents() if getattr(a, "is_connected", False)]
+        # 현재 UI에서는 복제 선택을 제거하고 선택/전체만 운용한다.
+        if self.selected_agent and getattr(self.selected_agent, "is_connected", False):
+            return [self.selected_agent]
+        return agents
 
-    # ────────────────────────────────────────────────────────────────
-    #  설정
-    # ────────────────────────────────────────────────────────────────
+    def tap_key(self, agent, vk: int, key_mods: list[str]):
+        agent.send(Command.key_press(vk, key_mods))
+        time.sleep(random.uniform(0.035, 0.08))
+        agent.send(Command.key_release(vk, key_mods))
 
-    def _apply_secret(self):
-        self._secret = self._secret_entry.get()
-        self._status("Secret updated — reconnect agents to apply")
+    def move(self, agent, x: int, y: int):
+        agent.send(Command.mouse_move(x, y, absolute=True))
+        self.last_positions[_agent_key(agent)] = (x, y)
 
-    def _save_settings(self):
-        self._cfg["fps"]    = int(self._fps_slider.get())
-        self._cfg["secret"] = self._secret_entry.get()
-        save_config(self._cfg)
-        self._status("Settings saved")
+    def natural_move(self, agent, x: int, y: int, duration: float, jitter: float):
+        start = self.last_positions.get(_agent_key(agent), (x, y))
+        steps = max(3, min(80, int(duration / 16)))
+        for i in range(1, steps + 1):
+            t = i / steps
+            eased = t * t * (3 - 2 * t)
+            nx = start[0] + (x - start[0]) * eased
+            ny = start[1] + (y - start[1]) * eased
+            if i != steps:
+                nx += random.uniform(-jitter, jitter)
+                ny += random.uniform(-jitter, jitter)
+            agent.send(Command.mouse_move(int(nx), int(ny), absolute=True))
+            time.sleep(max(0.001, duration / steps / 1000.0))
+        self.last_positions[_agent_key(agent)] = (x, y)
 
-    def _save_agent_list(self):
-        self._cfg["agents"] = [
-            {"host": a.agent.host, "port": a.agent.port}
-            for a in self._cards]
-        save_config(self._cfg)
+    def click(self, agent, button: str):
+        agent.send(Command.mouse_down(button))
+        time.sleep(random.uniform(0.035, 0.09))
+        agent.send(Command.mouse_up(button))
 
-    def _restore_agents(self):
-        for entry in self._cfg.get("agents", []):
-            agent = self.manager.add(entry["host"], entry["port"])
-            agent.auto_reconnect = True
-            agent.connect()
-            self._add_card(agent)
+    def delay_range(self) -> tuple[int, int]:
+        if not hasattr(self, "delay_min_entry"):
+            return 0, 0
+        lo = int(_seconds_to_ms(self.delay_min_entry.get()))
+        hi = int(_seconds_to_ms(self.delay_max_entry.get()))
+        return min(lo, hi), max(lo, hi)
 
-    # ────────────────────────────────────────────────────────────────
+    def toggle_mirror(self):
+        self.mirror_mode.set(not self.mirror_mode.get())
 
-    def _status(self, msg: str):
-        self._stat_msg.configure(text=msg)
+    def save_settings(self, silent: bool = False):
+        self.cfg["theme"] = self.theme_name
+        self.cfg["secret"] = self.secret
+        lo, hi = self.delay_range()
+        self.cfg["delay_min_ms"] = lo
+        self.cfg["delay_max_ms"] = hi
+        self.cfg["monitor_names"] = self.monitor_names
+        self.cfg["monitor_order"] = self.monitor_order
+        self.save_agent_list(write=False)
+        save_config(self.cfg)
+        if not silent:
+            self.set_status("설정 저장됨")
+
+    def save_agent_list(self, write: bool = True):
+        self.cfg["agents"] = [
+            {"host": a.host, "port": a.port}
+            for a in self.manager.all_agents()
+            if not getattr(a, "is_debug", False)
+        ]
+        if write:
+            save_config(self.cfg)
+
+    def restore_agents(self):
+        for entry in self.cfg.get("agents", []):
+            host = entry.get("host")
+            if not host:
+                continue
+            agent = self.manager.add(host, int(entry.get("port", DEFAULT_PORT)))
+            if not self.selected_agent:
+                self.select_agent(agent)
+            threading.Thread(target=lambda a=agent: (a.connect(timeout=3.0), self.root.after(0, self.refresh_all)), daemon=True).start()
+
+    def agent_refresh_signature(self) -> tuple:
+        signature = []
+        for agent in self.all_agents():
+            latency = float(getattr(agent, "latency_ms", -1) or -1)
+            if latency < 0:
+                latency_bucket = -1
+            elif latency >= 800:
+                latency_bucket = 8
+            else:
+                latency_bucket = int(latency // 100)
+            signature.append(
+                (
+                    _agent_key(agent),
+                    bool(getattr(agent, "is_connected", False)),
+                    latency_bucket,
+                    bool(getattr(agent, "vhf_installed", False)),
+                    str(agent),
+                )
+            )
+        return tuple(signature)
+
+    def refresh_all(self, force: bool = False):
+        signature = self.agent_refresh_signature()
+        if not force and signature == self._last_agent_signature:
+            return
+        self._last_agent_signature = signature
+        self.rebuild_agent_cards()
+        if hasattr(self, "status_dock"):
+            self.status_dock.refresh(self.all_agents())
+        if self.wall is not None and self.wall.winfo_exists():
+            self.wall.sync(self.all_agents())
+            self.wall.select_keys(self.monitor_selected_keys)
+
+    def tick(self):
+        self.refresh_all()
+        self.root.after(1000, self.tick)
+
+    def set_status(self, text: str):
+        self.status.configure(text=text)
+
+    def on_close(self):
+        if self.wall is not None:
+            self.wall.stop_all()
+        self.root.destroy()
 
     def run(self):
         self.root.mainloop()
 
 
-# ──────────────────────────────────────────────────────────────────────
-#  UI 헬퍼 함수
-# ──────────────────────────────────────────────────────────────────────
-
-def _lbl(parent, text: str, small: bool = False) -> ctk.CTkLabel:
-    return ctk.CTkLabel(
-        parent, text=text,
-        font=ctk.CTkFont(
-            size=9 if small else 10,
-            weight="bold" if not small else "normal"),
-        text_color=MUTED if small else TEXT)
+def _section(parent, app: MainWindow) -> ctk.CTkFrame:
+    c = app.colors
+    return ctk.CTkFrame(parent, fg_color=c["panel"], corner_radius=12, border_width=1, border_color=c["stroke"])
 
 
-def _entry(parent, placeholder: str = "", width: int = 160) -> ctk.CTkEntry:
-    return ctk.CTkEntry(
-        parent, placeholder_text=placeholder, width=width,
-        fg_color=BG, border_color=BORDER,
-        font=ctk.CTkFont(family="Consolas", size=11),
-        text_color=TEXT)
+def _entry(parent, app: MainWindow, placeholder: str, width: int = 160) -> ctk.CTkEntry:
+    c = app.colors
+    return ctk.CTkEntry(parent, placeholder_text=placeholder, width=width, fg_color=c["bg"], border_color=c["stroke"], text_color=c["text"], font=ctk.CTkFont(family="Consolas", size=12))
 
 
-def _action_btn(parent, text: str, color: str,
-                command, width: int = 100, height: int = 32,
-                text_color: str = TEXT) -> ctk.CTkButton:
-    return ctk.CTkButton(
-        parent, text=text, width=width, height=height,
-        fg_color=color,
-        hover_color=_darken(color),
-        text_color=text_color,
-        font=ctk.CTkFont(weight="bold", size=11),
-        corner_radius=7,
-        command=command)
+def _button(parent, app: MainWindow, text: str, command, width: int = 110, height: int = 34, color: Optional[str] = None, text_color: Optional[str] = None) -> ctk.CTkButton:
+    c = app.colors
+    base = color or c["blue"]
+    return ctk.CTkButton(parent, text=text, width=width, height=height, fg_color=base, hover_color=c["hover"], text_color=text_color or c["text"], corner_radius=8, command=command)
 
 
-def _darken(hex_color: str) -> str:
-    """색상을 약간 어둡게."""
-    _map = {
-        "#3fb950": "#2ea043",
-        "#58a6ff": "#4a8fd4",
-        "#f85149": "#da3633",
-        "#1c2128": "#2d333b",
-        "#21262d": "#2d333b",
-        "#30363d": "#444c56",
-    }
-    return _map.get(hex_color, "#444c56")
+def _mini_button(parent, app: MainWindow, text: str, command, width: int = 32, color: Optional[str] = None) -> ctk.CTkButton:
+    c = app.colors
+    return ctk.CTkButton(parent, text=text, width=width, height=28, fg_color=color or c["panel2"], hover_color=c["hover"], text_color=c["text"], corner_radius=7, command=command)
+
+
+def _agent_key(agent) -> str:
+    if agent is None:
+        return ""
+    return f"{getattr(agent, 'host', '')}:{getattr(agent, 'port', '')}"
+
+
+def _parse_vk(value: str) -> int:
+    text = value.strip()
+    upper = text.upper()
+    if upper in KEY_NAME_TO_VK:
+        return KEY_NAME_TO_VK[upper]
+    if len(text) == 1:
+        return ord(text.upper())
+    return int(text, 16) if text.lower().startswith("0x") else int(text)
+
+
+def _display_key(value) -> str:
+    text = str(value).strip()
+    try:
+        vk = int(text, 16) if text.lower().startswith("0x") else int(text)
+    except Exception:
+        return text
+    for name, code in KEY_NAME_TO_VK.items():
+        if code == vk:
+            return "Esc" if name == "ESC" else name.title()
+    if 0x30 <= vk <= 0x39 or 0x41 <= vk <= 0x5A:
+        return chr(vk)
+    return text
+
+
+def mods(value) -> list[str]:
+    if isinstance(value, list):
+        return value
+    return [part.strip().lower() for part in str(value).replace("+", ",").split(",") if part.strip()]
+
+
+def _parse_key_combo(key_value: str, mod_value) -> tuple[str, list[str]]:
+    parts = [part.strip() for part in key_value.replace(",", "+").split("+") if part.strip()]
+    key = parts[-1] if parts else key_value
+    combo_mods = [part.lower() for part in parts[:-1] if part.lower() in {"ctrl", "control", "shift", "alt", "win", "windows"}]
+    normalized = []
+    for mod in combo_mods + mods(mod_value):
+        mod = {"control": "ctrl", "windows": "win"}.get(mod, mod)
+        if mod in {"ctrl", "shift", "alt", "win"} and mod not in normalized:
+            normalized.append(mod)
+    return key, normalized
+
+
+def _image_file_to_data_url(path: str) -> str:
+    path = os.path.expandvars(os.path.expanduser(path))
+    if not os.path.isabs(path):
+        path = os.path.abspath(path)
+    ext = os.path.splitext(path)[1].lower()
+    mime = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".bmp": "image/bmp",
+    }.get(ext, "application/octet-stream")
+    with open(path, "rb") as f:
+        encoded = base64.b64encode(f.read()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def _int(value, fallback: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return fallback
+
+
+def _float(value, fallback: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return fallback
+
+
+def _seconds_to_ms(value, fallback_seconds: float = 0.0) -> float:
+    return max(0.0, _float(value, fallback_seconds) * 1000.0)
+
+
+def _ms_to_seconds(value, fallback_ms: float = 0.0) -> float:
+    return max(0.0, _float(value, fallback_ms) / 1000.0)
+
+
+def _format_seconds(value: float) -> str:
+    text = f"{value:.2f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def default_workflow() -> list[dict]:
+    return [
+        {"type": "대기", "ms": 400},
+        {"type": "자연 이동", "x": 960, "y": 540, "duration": 650, "jitter": 3},
+        {"type": "랜덤 클릭", "x1": 850, "y1": 450, "x2": 1070, "y2": 630, "button": "left"},
+        {"type": "대기", "ms": 700},
+        {"type": "키 입력", "key": "0x52", "mods": ""},
+    ]

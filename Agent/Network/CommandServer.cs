@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.Json;
 using Agent.HID;
 using Agent.Models;
+using Agent.Screen;
 
 public sealed class CommandServer : IDisposable
 {
@@ -64,7 +65,12 @@ public sealed class CommandServer : IDisposable
 
                 var json = Encoding.UTF8.GetString(Crypto.Decrypt(encrypted, _key));
                 var cmd  = JsonSerializer.Deserialize<HidCommand>(json);
-                if (cmd != null) Dispatch(cmd);
+                if (cmd != null)
+                {
+                    var response = Dispatch(cmd);
+                    if (!string.IsNullOrWhiteSpace(cmd.RequestId))
+                        await WriteResponseAsync(stream, cmd.RequestId!, response, _cts.Token);
+                }
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -73,8 +79,20 @@ public sealed class CommandServer : IDisposable
         }
     }
 
-    private void Dispatch(HidCommand cmd)
+    private object Dispatch(HidCommand cmd)
     {
+        if (cmd.Type == "ping")
+        {
+            return new { ok = true, type = "pong", ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() };
+        }
+        if (cmd.Type == "query" && cmd.Action == "status")
+        {
+            return ScreenCapture.Status();
+        }
+        if (cmd.Type == "image" && cmd.Action == "find")
+        {
+            return ImageDetector.Find(cmd.Data);
+        }
         if (cmd.Type == "keyboard" && cmd.Keyboard is { } kb)
         {
             byte mods = HidReportBuilder.ModifierByte(kb.Modifiers);
@@ -91,6 +109,25 @@ public sealed class CommandServer : IDisposable
                 case "scroll": _hid.MouseScroll(m.ScrollDelta); break;
             }
         }
+        return new { ok = true };
+    }
+
+    private async Task WriteResponseAsync(NetworkStream stream, string requestId, object payload, CancellationToken token)
+    {
+        var response = JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            requestId,
+            data = payload
+        });
+        var encrypted = Crypto.Encrypt(response, _key);
+        byte[] lenBytes = new byte[4];
+        int len = encrypted.Length;
+        lenBytes[0] = (byte)(len >> 24);
+        lenBytes[1] = (byte)(len >> 16);
+        lenBytes[2] = (byte)(len >> 8);
+        lenBytes[3] = (byte)len;
+        await stream.WriteAsync(lenBytes, token);
+        await stream.WriteAsync(encrypted, token);
     }
 
     public void Dispose()

@@ -1,7 +1,8 @@
 import json
 import time
+import uuid
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, Any
 
 
 @dataclass
@@ -34,19 +35,27 @@ class MouseData:
 class Command:
     def __init__(self, cmd_type: str, action: str,
                  keyboard: Optional[KeyboardData] = None,
-                 mouse: Optional[MouseData] = None):
+                 mouse: Optional[MouseData] = None,
+                 data: Optional[dict[str, Any]] = None,
+                 request_id: Optional[str] = None):
         self.type = cmd_type
         self.action = action
         self.keyboard = keyboard
         self.mouse = mouse
+        self.data = data
+        self.request_id = request_id
         self.ts = int(time.time() * 1000)
 
     def to_json(self) -> bytes:
         d = {"type": self.type, "action": self.action, "ts": self.ts}
+        if self.request_id:
+            d["requestId"] = self.request_id
         if self.keyboard:
             d["keyboard"] = self.keyboard.to_dict()
         if self.mouse:
             d["mouse"] = self.mouse.to_dict()
+        if self.data is not None:
+            d["data"] = self.data
         return json.dumps(d).encode("utf-8")
 
     # ---- 팩토리 메서드 ----
@@ -74,3 +83,7 @@ class Command:
     @staticmethod
     def mouse_scroll(delta: int) -> "Command":
         return Command("mouse", "scroll", mouse=MouseData(scroll_delta=delta))
+
+    @staticmethod
+    def request(cmd_type: str, action: str, data: Optional[dict[str, Any]] = None) -> "Command":
+        return Command(cmd_type, action, data=data, request_id=str(uuid.uuid4()))

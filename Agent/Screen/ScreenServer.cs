@@ -54,8 +54,8 @@ public sealed class ScreenServer : IDisposable
                 var t0 = DateTime.UtcNow;
 
                 // 해상도 정보를 첫 바이트에 포함하는 메타 헤더 [4B W][4B H][JPEG]
-                int w = ScreenCapture.ScreenWidth;
-                int h = ScreenCapture.ScreenHeight;
+                int w = ScreenCapture.VirtualWidth;
+                int h = ScreenCapture.VirtualHeight;
                 byte[] jpeg = ScreenCapture.CaptureJpeg();
 
                 // 메타 + JPEG 합치기

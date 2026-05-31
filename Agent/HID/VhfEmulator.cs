@@ -29,6 +29,8 @@ public sealed class VhfEmulator : IHidEmulator
     private const uint OPEN_EXISTING = 3;
 
     private SafeFileHandle? _handle;
+    private int? _lastAbsoluteX;
+    private int? _lastAbsoluteY;
 
     public string Name => "VHF 가상 HID (하드웨어 인식)";
     public bool IsHardwareLike => true;
@@ -62,8 +64,23 @@ public sealed class VhfEmulator : IHidEmulator
 
     public void MouseMove(int x, int y, bool absolute)
     {
-        // 상대 이동만 지원 (드라이버 마우스 디스크립터가 relative)
-        // absolute 좌표는 호출자가 이전 위치 대비 delta를 계산해서 전달
+        if (absolute)
+        {
+            if (_lastAbsoluteX is null || _lastAbsoluteY is null)
+            {
+                _lastAbsoluteX = x;
+                _lastAbsoluteY = y;
+                return;
+            }
+
+            int deltaX = x - _lastAbsoluteX.Value;
+            int deltaY = y - _lastAbsoluteY.Value;
+            _lastAbsoluteX = x;
+            _lastAbsoluteY = y;
+            x = deltaX;
+            y = deltaY;
+        }
+
         sbyte dx = (sbyte)Math.Clamp(x, -127, 127);
         sbyte dy = (sbyte)Math.Clamp(y, -127, 127);
         Send(0x01, HidReportBuilder.MouseReport(0, dx, dy));

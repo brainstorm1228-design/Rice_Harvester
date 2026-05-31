@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using System.Text.Json;
 
 namespace Agent.Models;
 
@@ -18,6 +19,12 @@ public record HidCommand
 
     [JsonPropertyName("ts")]
     public long Timestamp { get; init; }
+
+    [JsonPropertyName("requestId")]
+    public string? RequestId { get; init; }
+
+    [JsonPropertyName("data")]
+    public JsonElement? Data { get; init; }
 }
 
 public record KeyboardData

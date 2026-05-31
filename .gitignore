@@ -19,6 +19,8 @@ obj/
 # Build output
 Build/
 *_Test/
+setup.inf
+setup.rpt
 
 # Runtime / secrets
 rice_harvester.json
@@ -27,4 +29,3 @@ rice_harvester.json
 
 # PyInstaller temp
 _pyi_*
-

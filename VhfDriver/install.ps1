@@ -1,44 +1,65 @@
-# VhfDriver 설치 스크립트 (관리자 권한 필요)
-# 빌드 후 Build\VhfDriver\ 디렉토리에서 실행
-
 param(
     [switch]$Uninstall,
-    [switch]$TestSign   # 테스트 서명 모드 (개발 환경)
+    [switch]$TestSign,
+    [switch]$NoDeviceInstall
 )
 
-$driverPath = Join-Path $PSScriptRoot "..\Build\VhfDriver\VhfDriver.sys"
-$infPath    = Join-Path $PSScriptRoot "VhfDriver.inf"
+$ErrorActionPreference = "Stop"
+
+function Test-Admin {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+if (-not (Test-Admin)) {
+    throw "Administrator privileges are required to install or remove the VHF driver."
+}
+
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$infPath = Join-Path $scriptDir "VhfDriver.inf"
+$driverPath = Join-Path $scriptDir "VhfDriver.sys"
+
+if (-not (Test-Path $driverPath)) {
+    $sourceBuildDriver = Join-Path $scriptDir "..\Build\VhfDriver\VhfDriver.sys"
+    if (Test-Path $sourceBuildDriver) {
+        $driverPath = [System.IO.Path]::GetFullPath($sourceBuildDriver)
+    }
+}
 
 if ($Uninstall) {
-    Write-Host "[*] 드라이버 제거 중..."
+    Write-Host "[VHF] Removing driver package and service..."
     pnputil /delete-driver VhfDriver.inf /uninstall /force
-    sc.exe delete VhfDriver
-    Write-Host "[+] 제거 완료"
+    sc.exe delete VhfDriver | Out-Null
+    Write-Host "[VHF] Removed."
     exit 0
 }
 
 if ($TestSign) {
-    Write-Host "[*] 테스트 서명 모드 활성화 (재부팅 필요)"
+    Write-Host "[VHF] Enabling Windows test-signing mode. Reboot is required."
     bcdedit /set testsigning on
-    Write-Host "[!] 시스템을 재부팅한 후 다시 실행하세요."
     exit 0
 }
 
-if (-not (Test-Path $driverPath)) {
-    Write-Error "VhfDriver.sys not found. 먼저 Visual Studio + WDK로 빌드하세요."
-    exit 1
+if (-not (Test-Path $infPath)) {
+    throw "VhfDriver.inf not found: $infPath"
 }
 
-Write-Host "[*] 드라이버 설치 중..."
+if (-not (Test-Path $driverPath)) {
+    throw "VhfDriver.sys not found. Build the driver first, then rerun the Agent installer."
+}
+
+Write-Host "[VHF] Installing driver from $infPath"
 pnputil /add-driver $infPath /install
 
-# 루트 열거 장치 생성 (소프트웨어 장치)
-$devcon = Get-Command devcon.exe -ErrorAction SilentlyContinue
-if ($devcon) {
-    devcon install $infPath Root\VhfDriver
-} else {
-    Write-Host "[!] devcon.exe를 찾을 수 없습니다. 수동으로 장치를 추가하세요:"
-    Write-Host "    장치 관리자 → 작업 → 레거시 하드웨어 추가 → 목록에서 선택"
+if (-not $NoDeviceInstall) {
+    $devcon = Get-Command devcon.exe -ErrorAction SilentlyContinue
+    if ($devcon) {
+        Write-Host "[VHF] Creating root device Root\VhfDriver..."
+        devcon install $infPath Root\VhfDriver
+    } else {
+        Write-Warning "devcon.exe was not found. If the device is not created automatically, install Root\VhfDriver manually from Device Manager."
+    }
 }
 
-Write-Host "[+] 설치 완료. QA HID Companion이 Device Manager에 나타나야 합니다."
+Write-Host "[VHF] Install complete. Device Manager should show QA HID Companion (VHF)."

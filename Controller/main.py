@@ -3,13 +3,14 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config import DEFAULT_SECRET
+from config import DEFAULT_SECRET, load_config
 from network.agent_manager import AgentManager
 from ui.main_window import MainWindow
 
 
 def main():
-    secret = os.environ.get("AGENT_SECRET", DEFAULT_SECRET)
+    cfg = load_config()
+    secret = os.environ.get("AGENT_SECRET") or cfg.get("secret") or DEFAULT_SECRET
     manager = AgentManager(secret=secret)
     MainWindow(manager, secret=secret).run()
 

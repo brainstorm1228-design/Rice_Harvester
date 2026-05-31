@@ -1,4 +1,5 @@
 import hashlib
+import json
 import socket
 import struct
 import threading
@@ -22,6 +23,7 @@ class AgentConnection:
         self._on_status_change = on_status_change
 
         self.latency_ms: float = -1.0   # 마지막 핑 결과 (ms)
+        self.last_status: dict = {}
         self.auto_reconnect = True
         self._reconnect_thread: Optional[threading.Thread] = None
 
@@ -71,21 +73,54 @@ class AgentConnection:
             self._handle_drop()
             return False
 
+    def request(self, command: Command, timeout: float = 5.0) -> Optional[dict]:
+        if not self.is_connected:
+            return None
+        if not command.request_id:
+            command.request_id = f"req-{time.time_ns()}"
+        try:
+            payload = self._encrypt(command.to_json())
+            packet = struct.pack(">I", len(payload)) + payload
+            with self._lock:
+                if not self._sock:
+                    return None
+                old_timeout = self._sock.gettimeout()
+                self._sock.settimeout(timeout)
+                try:
+                    self._sock.sendall(packet)
+                    header = self._recv_exact(4)
+                    length = struct.unpack(">I", header)[0]
+                    if length < 1 or length > 10_000_000:
+                        raise ValueError(f"invalid response length {length}")
+                    encrypted = self._recv_exact(length)
+                finally:
+                    self._sock.settimeout(old_timeout)
+            response = json.loads(self._decrypt(encrypted).decode("utf-8"))
+            if response.get("requestId") != command.request_id:
+                return None
+            return response.get("data")
+        except Exception as e:
+            print(f"[Manager] Request error {self}: {e}")
+            self._handle_drop()
+            return None
+
     # ── 핑 (레이턴시 측정) ───────────────────────────────────────────────
     # 프로토콜: type="ping" 명령 전송 후 응답 시간 측정 (단방향 RTT 추정)
 
     def ping(self) -> float:
         """전송 왕복 시간(ms)을 측정. 실패 시 -1 반환."""
         from models.command import Command as Cmd
-        import json, time as _t
+        import time as _t
         if not self.is_connected:
             return -1.0
         try:
             t0 = _t.monotonic()
-            ping_cmd = Cmd("ping", "ping")
-            self.send(ping_cmd)
-            self.latency_ms = round((_t.monotonic() - t0) * 1000, 1)
-            return self.latency_ms
+            ping_cmd = Cmd.request("ping", "ping")
+            res = self.request(ping_cmd, timeout=2.0)
+            if res and res.get("ok"):
+                self.latency_ms = round((_t.monotonic() - t0) * 1000, 1)
+                return self.latency_ms
+            return -1.0
         except Exception:
             return -1.0
 
@@ -93,6 +128,7 @@ class AgentConnection:
         def loop():
             while self.is_connected:
                 self.ping()
+                self.status()
                 self._notify()
                 time.sleep(3)
         threading.Thread(target=loop, daemon=True).start()
@@ -121,6 +157,38 @@ class AgentConnection:
         pad_len = 16 - len(data) % 16
         data   += bytes([pad_len] * pad_len)
         return iv + AES.new(self._key, AES.MODE_CBC, iv).encrypt(data)
+
+    def _decrypt(self, data: bytes) -> bytes:
+        iv = data[:16]
+        body = AES.new(self._key, AES.MODE_CBC, iv).decrypt(data[16:])
+        pad_len = body[-1]
+        if 1 <= pad_len <= 16:
+            return body[:-pad_len]
+        return body
+
+    def _recv_exact(self, size: int) -> bytes:
+        chunks = []
+        remaining = size
+        while remaining > 0:
+            if not self._sock:
+                raise ConnectionError("socket closed")
+            chunk = self._sock.recv(remaining)
+            if not chunk:
+                raise ConnectionError("socket closed")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def status(self) -> Optional[dict]:
+        res = self.request(Command.request("query", "status"), timeout=3.0)
+        if isinstance(res, dict):
+            self.last_status = res
+        return res
+
+    def find_image(self, image_data: str, **options) -> Optional[dict]:
+        timeout_ms = int(options.get("timeoutMs", 3000))
+        data = {"imageData": image_data, **options}
+        return self.request(Command.request("image", "find", data=data), timeout=max(3.0, timeout_ms / 1000.0 + 2.0))
 
     # ── 상태 ────────────────────────────────────────────────────────────
 
@@ -152,8 +220,15 @@ class AgentManager:
         self._agents: dict[str, AgentConnection] = {}
         self.on_status_change: Optional[Callable] = None
 
+    def set_secret(self, secret: str):
+        self._key = hashlib.sha256(secret.encode()).digest()
+        for agent in self._agents.values():
+            agent._key = self._key
+
     def add(self, host: str, port: int = 9000) -> AgentConnection:
         key  = f"{host}:{port}"
+        if key in self._agents:
+            return self._agents[key]
         conn = AgentConnection(host, port, self._key,
                                on_status_change=self.on_status_change)
         self._agents[key] = conn
