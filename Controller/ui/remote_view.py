@@ -7,6 +7,7 @@ from typing import Callable, Optional
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageGrab, ImageTk
 
+from config import save_workflow_file
 from models.command import Command
 from network.agent_manager import AgentConnection
 from network.screen_client import ScreenClient
@@ -46,12 +47,17 @@ class RemoteViewWindow:
         followers: Optional[list[AgentConnection]] = None,
         workflows_provider: Optional[Callable[[], list[dict]]] = None,
         workflow_runner: Optional[Callable[[str, list], None]] = None,
+        local_workflow_runner: Optional[Callable[[list[dict]], None]] = None,
     ):
         self.agent = agent
         self.followers = [a for a in (followers or []) if a is not agent]
         self._workflows_provider = workflows_provider or (lambda: [])
         self._workflow_runner = workflow_runner
+        self._local_workflow_runner = local_workflow_runner
         self._preset_names: list[str] = []
+        self._draft_steps: list[dict] = []
+        self._capture_mode: Optional[str] = None
+        self._last_remote_pos: Optional[tuple[int, int]] = None
         self._preset_delete_mode = False
         self._preset_picker: Optional[ctk.CTkFrame] = None
         self._preset_height = 26
@@ -77,9 +83,9 @@ class RemoteViewWindow:
 
     def _build_window(self):
         self.win = ctk.CTkToplevel()
-        self.win.title(f"모니터링 확대 - {self.agent}")
-        self.win.geometry("1280x760")
-        self.win.minsize(900, 560)
+        self.win.title(f"모니터링 작업 화면 - {self.agent}")
+        self.win.geometry("1500x840")
+        self.win.minsize(1100, 620)
         self.win.configure(fg_color=BG)
         self.win.protocol("WM_DELETE_WINDOW", self._on_close)
         self.win.bind("<Alt-F12>", lambda _e: self._toggle_mirror())
@@ -124,6 +130,18 @@ class RemoteViewWindow:
             text_color=GREEN,
         ).pack(side="right", padx=14)
 
+        body = ctk.CTkFrame(self.win, fg_color=BG, corner_radius=0)
+        body.pack(fill="both", expand=True)
+
+        self._canvas = tk.Canvas(body, bg="#05080c", cursor="crosshair", highlightthickness=0)
+        self._canvas.pack(side="left", fill="both", expand=True)
+        self._image_id = self._canvas.create_image(0, 0, anchor="nw")
+
+        self._workflow_panel = ctk.CTkFrame(body, fg_color=SURFACE, width=330, corner_radius=0)
+        self._workflow_panel.pack(side="right", fill="y")
+        self._workflow_panel.pack_propagate(False)
+        self._build_workflow_panel()
+
         self.workflow_bar = ctk.CTkFrame(self.win, fg_color=BG, height=self._preset_height, corner_radius=0)
         self.workflow_bar.pack(side="bottom", fill="x")
         self.workflow_bar.pack_propagate(False)
@@ -136,10 +154,6 @@ class RemoteViewWindow:
         self.preset_trash_slot.pack(side="right", fill="y")
         self.preset_trash_slot.pack_propagate(False)
         self._build_workflow_bar()
-
-        self._canvas = tk.Canvas(self.win, bg="#05080c", cursor="crosshair", highlightthickness=0)
-        self._canvas.pack(fill="both", expand=True)
-        self._image_id = self._canvas.create_image(0, 0, anchor="nw")
 
         self._canvas.bind("<Configure>", lambda _event: self._draw_latest())
         self._canvas.bind("<Motion>", self._on_mouse_move)
@@ -167,6 +181,152 @@ class RemoteViewWindow:
                 pass
 
         self.win.after(30, activate)
+
+    def _build_workflow_panel(self):
+        header = ctk.CTkFrame(self._workflow_panel, fg_color="transparent")
+        header.pack(fill="x", padx=14, pady=(14, 8))
+        ctk.CTkLabel(header, text="워크플로우 작업", font=ctk.CTkFont(size=16, weight="bold"), text_color=TEXT).pack(side="left")
+        ctk.CTkButton(header, text="초기화", width=62, height=26, fg_color=PANEL, hover_color="#29394c", text_color=TEXT, command=self._clear_draft).pack(side="right")
+
+        self._draft_name = ctk.CTkEntry(
+            self._workflow_panel,
+            placeholder_text="워크플로우 이름",
+            fg_color=BG,
+            border_color=STROKE,
+            text_color=TEXT,
+        )
+        self._draft_name.pack(fill="x", padx=14, pady=(0, 10))
+
+        ctk.CTkButton(self._workflow_panel, text="화면 클릭 -> 클릭 단계", height=32, fg_color=BLUE, hover_color="#5792e6", text_color="#07111f", command=lambda: self._set_capture_mode("click")).pack(fill="x", padx=14, pady=3)
+        ctk.CTkButton(self._workflow_panel, text="화면 클릭 -> 이동 단계", height=32, fg_color=PANEL, hover_color="#29394c", text_color=TEXT, command=lambda: self._set_capture_mode("move")).pack(fill="x", padx=14, pady=3)
+
+        quick = ctk.CTkFrame(self._workflow_panel, fg_color="transparent")
+        quick.pack(fill="x", padx=14, pady=(8, 4))
+        ctk.CTkButton(quick, text="대기", width=68, height=28, fg_color=PANEL, hover_color="#29394c", text_color=TEXT, command=lambda: self._append_step({"type": "대기", "ms": 500})).pack(side="left", padx=(0, 5))
+        ctk.CTkButton(quick, text="클릭", width=68, height=28, fg_color=PANEL, hover_color="#29394c", text_color=TEXT, command=self._append_click_at_last).pack(side="left", padx=5)
+        ctk.CTkButton(quick, text="저장", width=68, height=28, fg_color=GREEN, hover_color="#4fc98f", text_color="#07140d", command=self._save_draft_workflow).pack(side="right")
+
+        ctk.CTkLabel(self._workflow_panel, text="단계", text_color=MUTED, anchor="w").pack(fill="x", padx=14, pady=(8, 2))
+        self._steps_box = ctk.CTkScrollableFrame(self._workflow_panel, fg_color=BG, scrollbar_button_color=STROKE, scrollbar_button_hover_color="#29394c")
+        self._steps_box.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+        self._steps_box.grid_columnconfigure(0, weight=1)
+
+        run = ctk.CTkFrame(self._workflow_panel, fg_color="transparent")
+        run.pack(fill="x", padx=14, pady=(0, 14))
+        ctk.CTkButton(run, text="대상 실행", height=32, fg_color=BLUE, hover_color="#5792e6", text_color="#07111f", command=self._run_draft_on_targets).pack(fill="x", pady=(0, 6))
+        ctk.CTkButton(run, text="현재 PC 테스트", height=32, fg_color=PANEL, hover_color="#29394c", text_color=TEXT, command=self._run_draft_locally).pack(fill="x")
+        self._refresh_draft_steps()
+
+    def _set_capture_mode(self, mode: str):
+        self._capture_mode = mode
+        label = "클릭" if mode == "click" else "이동"
+        self._status_var.set(f"화면에서 위치를 클릭하면 {label} 단계가 추가됩니다")
+
+    def _append_step(self, step: dict):
+        self._draft_steps.append(step)
+        self._refresh_draft_steps()
+
+    def _append_click_at_last(self):
+        if self._last_remote_pos is None:
+            self._status_var.set("먼저 화면에서 위치를 선택하세요")
+            self._capture_mode = "click"
+            return
+        x, y = self._last_remote_pos
+        self._append_step({"type": "마우스 이동", "x": x, "y": y})
+        self._append_step({"type": "클릭", "button": "left"})
+
+    def _capture_step_at(self, event: tk.Event) -> bool:
+        if not self._capture_mode:
+            return False
+        pos = self._canvas_to_remote(event.x, event.y)
+        if pos is None:
+            self._status_var.set("화면 영역 안을 클릭하세요")
+            return True
+        self._last_remote_pos = pos
+        x, y = pos
+        if self._capture_mode == "click":
+            self._append_step({"type": "마우스 이동", "x": x, "y": y})
+            self._append_step({"type": "클릭", "button": "left"})
+            self._status_var.set(f"클릭 단계 추가: {x}, {y}")
+        else:
+            self._append_step({"type": "자연 이동", "x": x, "y": y, "duration": 650, "jitter": 3.0})
+            self._status_var.set(f"이동 단계 추가: {x}, {y}")
+        self._capture_mode = None
+        return True
+
+    def _step_label(self, step: dict) -> str:
+        kind = step.get("type", "")
+        if kind in {"마우스 이동", "자연 이동"}:
+            return f"{kind}  X {step.get('x', 0)}  Y {step.get('y', 0)}"
+        if kind == "대기":
+            return f"대기  {float(step.get('ms', 0)) / 1000:.1f}초"
+        if kind == "클릭":
+            return f"클릭  {step.get('button', 'left')}"
+        return str(kind)
+
+    def _refresh_draft_steps(self):
+        for child in self._steps_box.winfo_children():
+            child.destroy()
+        if not self._draft_steps:
+            ctk.CTkLabel(self._steps_box, text="아직 추가된 단계가 없습니다", text_color=MUTED).grid(row=0, column=0, sticky="ew", padx=8, pady=10)
+            return
+        for idx, step in enumerate(self._draft_steps):
+            row = ctk.CTkFrame(self._steps_box, fg_color=PANEL, corner_radius=8)
+            row.grid(row=idx, column=0, sticky="ew", padx=4, pady=4)
+            row.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(row, text=f"{idx + 1:02d}. {self._step_label(step)}", text_color=TEXT, anchor="w").grid(row=0, column=0, sticky="ew", padx=8, pady=7)
+            ctk.CTkButton(row, text="X", width=26, height=22, fg_color="#ff6b7a", hover_color="#29394c", text_color=TEXT, command=lambda i=idx: self._delete_draft_step(i)).grid(row=0, column=1, padx=(0, 6), pady=6)
+
+    def _delete_draft_step(self, index: int):
+        if 0 <= index < len(self._draft_steps):
+            self._draft_steps.pop(index)
+            self._refresh_draft_steps()
+
+    def _clear_draft(self):
+        self._draft_steps.clear()
+        self._refresh_draft_steps()
+        self._status_var.set("작업 워크플로우 초기화")
+
+    def _save_draft_workflow(self):
+        name = self._draft_name.get().strip()
+        if not name:
+            self._status_var.set("워크플로우 이름을 입력하세요")
+            return
+        if not self._draft_steps:
+            self._status_var.set("저장할 단계가 없습니다")
+            return
+        save_workflow_file({"name": name, "steps": self._draft_steps})
+        self._workflows_provider()
+        self._status_var.set(f"워크플로우 저장: {name}")
+
+    def _workflow_targets(self) -> list:
+        targets = []
+        if not getattr(self.agent, "is_debug", False):
+            targets.append(self.agent)
+        if self._mirror_var.get():
+            targets.extend([a for a in self.followers if getattr(a, "is_connected", False)])
+        return targets
+
+    def _run_draft_on_targets(self):
+        if not self._workflow_runner:
+            self._status_var.set("워크플로우 실행기를 찾을 수 없습니다")
+            return
+        targets = self._workflow_targets()
+        if not targets:
+            self._status_var.set("실행 대상이 없습니다")
+            return
+        self._workflow_runner("__draft__", targets, list(self._draft_steps))
+        self._status_var.set(f"작업 워크플로우 실행: {len(targets)}대")
+
+    def _run_draft_locally(self):
+        if not self._local_workflow_runner:
+            self._status_var.set("현재 PC 테스트 실행기를 찾을 수 없습니다")
+            return
+        if not self._draft_steps:
+            self._status_var.set("테스트할 단계가 없습니다")
+            return
+        self._local_workflow_runner(list(self._draft_steps))
+        self._status_var.set("현재 PC 테스트 실행")
 
     def _build_workflow_bar(self):
         for child in self.preset_items.winfo_children():
@@ -410,6 +570,7 @@ class RemoteViewWindow:
     def _send_pointer_position(self, event: tk.Event):
         pos = self._canvas_to_remote(event.x, event.y)
         if pos is not None:
+            self._last_remote_pos = pos
             self._send(Command.mouse_move(pos[0], pos[1], absolute=True))
 
     def _on_mouse_move(self, event: tk.Event):
@@ -420,6 +581,8 @@ class RemoteViewWindow:
         self._send_pointer_position(event)
 
     def _mouse_btn(self, event: tk.Event, button: str, down: bool):
+        if down and button == "left" and self._capture_step_at(event):
+            return
         self._send_pointer_position(event)
         self._send(Command.mouse_down(button) if down else Command.mouse_up(button))
 

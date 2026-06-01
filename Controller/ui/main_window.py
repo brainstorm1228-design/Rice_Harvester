@@ -1,4 +1,5 @@
 import base64
+import ctypes
 import io
 import os
 import random
@@ -86,6 +87,136 @@ def _debug_placeholder(detail: str = "") -> Image.Image:
         draw.text((48, 124), detail[:150], fill="#ff6b7a")
     return image
 
+
+if os.name == "nt":
+    ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+
+    class _MOUSEINPUT(ctypes.Structure):
+        _fields_ = (
+            ("dx", ctypes.c_long),
+            ("dy", ctypes.c_long),
+            ("mouseData", ctypes.c_ulong),
+            ("dwFlags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ULONG_PTR),
+        )
+
+    class _KEYBDINPUT(ctypes.Structure):
+        _fields_ = (
+            ("wVk", ctypes.c_ushort),
+            ("wScan", ctypes.c_ushort),
+            ("dwFlags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ULONG_PTR),
+        )
+
+    class _INPUTUNION(ctypes.Union):
+        _fields_ = (("mi", _MOUSEINPUT), ("ki", _KEYBDINPUT))
+
+    class _INPUT(ctypes.Structure):
+        _fields_ = (("type", ctypes.c_ulong), ("ii", _INPUTUNION))
+
+    _INPUT_MOUSE = 0
+    _INPUT_KEYBOARD = 1
+    _KEYEVENTF_KEYUP = 0x0002
+    _MOUSEEVENTF_MOVE = 0x0001
+    _MOUSEEVENTF_LEFTDOWN = 0x0002
+    _MOUSEEVENTF_LEFTUP = 0x0004
+    _MOUSEEVENTF_RIGHTDOWN = 0x0008
+    _MOUSEEVENTF_RIGHTUP = 0x0010
+    _MOUSEEVENTF_MIDDLEDOWN = 0x0020
+    _MOUSEEVENTF_MIDDLEUP = 0x0040
+    _MOUSEEVENTF_WHEEL = 0x0800
+    _MOUSEEVENTF_ABSOLUTE = 0x8000
+    _MOUSEEVENTF_VIRTUALDESK = 0x4000
+    _SM_XVIRTUALSCREEN = 76
+    _SM_YVIRTUALSCREEN = 77
+    _SM_CXVIRTUALSCREEN = 78
+    _SM_CYVIRTUALSCREEN = 79
+else:
+    _INPUT = None
+
+
+def _local_vk_for_modifier(name: str) -> int:
+    return {"ctrl": 0x11, "control": 0x11, "shift": 0x10, "alt": 0x12, "win": 0x5B, "windows": 0x5B}.get(name.lower(), 0)
+
+
+def _send_input_record(record) -> bool:
+    if os.name != "nt" or _INPUT is None:
+        return False
+    sent = ctypes.windll.user32.SendInput(1, ctypes.byref(record), ctypes.sizeof(record))
+    return sent == 1
+
+
+def _send_local_key(vk: int, down: bool):
+    if os.name != "nt" or not vk:
+        return
+    flags = 0 if down else _KEYEVENTF_KEYUP
+    record = _INPUT(type=_INPUT_KEYBOARD, ii=_INPUTUNION(ki=_KEYBDINPUT(vk, 0, flags, 0, 0)))
+    _send_input_record(record)
+
+
+def _send_local_mouse_move(x: int, y: int, absolute: bool):
+    if os.name != "nt":
+        return
+    flags = _MOUSEEVENTF_MOVE
+    dx, dy = x, y
+    if absolute:
+        user32 = ctypes.windll.user32
+        vx = user32.GetSystemMetrics(_SM_XVIRTUALSCREEN)
+        vy = user32.GetSystemMetrics(_SM_YVIRTUALSCREEN)
+        vw = max(1, user32.GetSystemMetrics(_SM_CXVIRTUALSCREEN) - 1)
+        vh = max(1, user32.GetSystemMetrics(_SM_CYVIRTUALSCREEN) - 1)
+        dx = int((x - vx) * 65535 / vw)
+        dy = int((y - vy) * 65535 / vh)
+        flags |= _MOUSEEVENTF_ABSOLUTE | _MOUSEEVENTF_VIRTUALDESK
+    record = _INPUT(type=_INPUT_MOUSE, ii=_INPUTUNION(mi=_MOUSEINPUT(dx, dy, 0, flags, 0, 0)))
+    _send_input_record(record)
+
+
+def _send_local_mouse_button(button: str, down: bool):
+    if os.name != "nt":
+        return
+    table = {
+        "left": (_MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP),
+        "right": (_MOUSEEVENTF_RIGHTDOWN, _MOUSEEVENTF_RIGHTUP),
+        "middle": (_MOUSEEVENTF_MIDDLEDOWN, _MOUSEEVENTF_MIDDLEUP),
+    }
+    flags = table.get(button.lower(), table["left"])[0 if down else 1]
+    record = _INPUT(type=_INPUT_MOUSE, ii=_INPUTUNION(mi=_MOUSEINPUT(0, 0, 0, flags, 0, 0)))
+    _send_input_record(record)
+
+
+def _send_local_input(command: Command) -> bool:
+    if os.name != "nt":
+        return False
+    if command.type == "keyboard" and command.keyboard:
+        mods = [_local_vk_for_modifier(m) for m in command.keyboard.modifiers]
+        mods = [m for m in mods if m]
+        if command.action == "press":
+            for mod in mods:
+                _send_local_key(mod, True)
+            _send_local_key(command.keyboard.key_code, True)
+        elif command.action == "release":
+            _send_local_key(command.keyboard.key_code, False)
+            for mod in reversed(mods):
+                _send_local_key(mod, False)
+        return True
+    if command.type == "mouse" and command.mouse:
+        mouse = command.mouse
+        if command.action == "move":
+            _send_local_mouse_move(mouse.x, mouse.y, mouse.absolute)
+        elif command.action == "down":
+            _send_local_mouse_button(mouse.button, True)
+        elif command.action == "up":
+            _send_local_mouse_button(mouse.button, False)
+        elif command.action == "scroll":
+            record = _INPUT(type=_INPUT_MOUSE, ii=_INPUTUNION(mi=_MOUSEINPUT(0, 0, mouse.scroll_delta, _MOUSEEVENTF_WHEEL, 0, 0)))
+            _send_input_record(record)
+        return True
+    return False
+
+
 THEMES = {
     "dark": {
         "bg": "#080c11",
@@ -156,6 +287,7 @@ class DebugAgent:
         return None
 
     def send(self, command: Command) -> bool:
+        _send_local_input(command)
         return True
 
     def status(self) -> dict:
@@ -1414,7 +1546,8 @@ class MainWindow:
             self.secret,
             followers=[] if getattr(agent, "is_debug", False) else self.mirror_targets(agent),
             workflows_provider=lambda: self.reload_workflows_from_disk(update_ui=False),
-            workflow_runner=lambda name, agents: self.run_saved_workflow_for_agents(name, agents),
+            workflow_runner=lambda name, agents, steps=None: self.run_saved_workflow_for_agents(name, agents, steps),
+            local_workflow_runner=self.run_workflow_on_current_pc,
         )
 
     def mirror_targets(self, primary) -> list:
@@ -1646,18 +1779,27 @@ class MainWindow:
             targets = [self.selected_agent]
         self.run_saved_workflow_for_agents(name, targets)
 
-    def run_saved_workflow_for_agents(self, name: str, agents: list):
-        wf = self.find_workflow(name)
-        if not wf:
-            self.set_status(f"워크플로우를 찾을 수 없습니다: {name}")
-            return
+    def run_saved_workflow_for_agents(self, name: str, agents: list, draft_steps: Optional[list[dict]] = None):
+        if draft_steps is None:
+            wf = self.find_workflow(name)
+            if not wf:
+                self.set_status(f"워크플로우를 찾을 수 없습니다: {name}")
+                return
+            steps = wf.get("steps", [])
+        else:
+            steps = draft_steps
         targets = [a for a in agents if getattr(a, "is_connected", False)]
         if not targets:
             self.set_status("선택된 모니터링 PC가 없습니다.")
             return
         repeat = max(1, _int(self.repeat_var.get(), 1)) if hasattr(self, "repeat_var") else 1
-        self.run_steps_for_agents(wf.get("steps", []), targets, repeat)
+        self.run_steps_for_agents(steps, targets, repeat)
         self.set_status(f"{name} 실행: {len(targets)}대")
+
+    def run_workflow_on_current_pc(self, steps: list[dict]):
+        tester = DebugAgent(0)
+        threading.Thread(target=self.run_workflow_for_agent, args=(tester, steps, 1), daemon=True).start()
+        self.set_status("현재 PC 테스트 실행")
 
     def run_steps_for_agents(self, steps: list[dict], agents: list, repeat: int = 1):
         self.macro_stop = False
