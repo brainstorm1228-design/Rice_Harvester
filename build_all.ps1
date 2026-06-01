@@ -56,7 +56,7 @@ function New-DefaultInnoScript([string]$ScriptPath) {
 [Setup]
 AppId={{6D392E9E-040D-46E2-AFC7-RICEHARVESTER}}
 AppName=Rice Harvester
-AppVersion=0.1.0-alpha
+AppVersion=1.0.0
 AppPublisher=Rice Harvester
 DefaultDirName={autopf}\Rice Harvester
 DefaultGroupName=Rice Harvester
@@ -260,7 +260,7 @@ function New-DefaultSplitInnoScripts {
 [Setup]
 AppId={{D41285AB-6D43-4768-A99E-2E2B98B9A101}}
 AppName=Rice Harvester Controller
-AppVersion=0.1.0-alpha
+AppVersion=1.0.0
 AppPublisher=Rice Harvester
 DefaultDirName={autopf}\Rice Harvester
 DefaultGroupName=Rice Harvester
@@ -290,7 +290,7 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 [Setup]
 AppId={{1CFE499A-79BB-4891-A44E-7E0B2195D402}}
 AppName=Rice Harvester Agent
-AppVersion=0.1.0-alpha
+AppVersion=1.0.0
 AppPublisher=Rice Harvester
 DefaultDirName={autopf}\Rice Harvester
 DefaultGroupName=Rice Harvester
